@@ -1,0 +1,12 @@
+{
+  "id": "{{name}}",
+  "name": "{{platform}} connector",
+  "kind": "sales",
+  "category": "ECOMMERCE",
+  "platform": "{{platform}}",
+  "language": "csharp",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "repository": "",
+  "description": "Sends {{platform}} orders and refunds to Ino Loyalty and receives loyalty events."
+}

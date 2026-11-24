@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>ino</AssemblyName>
+    <RootNamespace>Ino.Cli</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- One self-contained file per platform; no AOT (reflection-based JSON and System.CommandLine stay simple). -->
+    <!-- Publish with: dotnet publish -c Release -r RID, self-contained. Self-contained is set only when publishing, so engine tests can reference the project. -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained Condition="'$(_IsPublishing)' == 'true'">true</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.CommandLine" Version="3.0.0" />
+    <PackageReference Include="ModelContextProtocol" Version="2.4.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="../../docs/*.md" LogicalName="docs/%(Filename)%(Extension)" />
+    <EmbeddedResource Include="../../skills/*/SKILL.md" LogicalName="skills/%(RecursiveDir)SKILL.md" />
+    <!-- MCP/CLI P6a: the store catalog is verified with the same code as the engine (BCL only). -->
+    <!-- Hub/HubEnvelope.cs: shared with the Ino Loyalty engine, which verifies the same catalog. -->
+  </ItemGroup>
+  <PropertyGroup>
+    <DefineConstants>$(DefineConstants);INO_CLI</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="../../templates/**/*" Exclude="../../templates/**/node_modules/**;../../templates/**/data/**;../../templates/**/bin/**;../../templates/**/obj/**;../../templates/**/__pycache__/**" LogicalName="templates/%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Ino.Cli.Tests" />
+  </ItemGroup>
+</Project>
