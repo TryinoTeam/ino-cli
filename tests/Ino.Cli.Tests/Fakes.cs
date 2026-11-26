@@ -54,6 +54,9 @@ sealed class Harness : IDisposable
     /// <summary>When set, the engine side answers through this instead of <see cref="Http"/>.</summary>
     public HttpMessageHandler? Api;
     public HttpMessageHandler? Local;
+    /// <summary>Fake browser and Ino Auth for `ino login`.</summary>
+    public Func<Uri, Task>? Browser;
+    public HttpMessageHandler? Auth;
     /// <summary>The store catalog and Tryino's intake (`ino hub`).</summary>
     public HttpMessageHandler? Hub;
     /// <summary>git and other captured commands (`ino hub submit`).</summary>
@@ -70,7 +73,7 @@ sealed class Harness : IDisposable
         {
             Out = o, Err = e, In = new StringReader(stdin), InputIsTerminal = false, Env = Env, Profiles = Store,
             ClientFactory = (c, l) => new ChannelClient(c, Api ?? Http) { Lock = l },
-            LocalHandler = Local, Delay = Delay, HubHandler = Hub, Capture = Capture,
+            LocalHandler = Local, Delay = Delay, HubHandler = Hub, Capture = Capture, OpenBrowser = Browser, AuthHandler = Auth,
         };
         var code = await Commands.RunAsync(args, ctx, Token);
         return (code, o.ToString(), e.ToString());

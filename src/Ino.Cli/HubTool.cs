@@ -15,7 +15,6 @@ public static partial class HubTool
     public const string DefaultIntakeUrl = "https://chat.tryino.com/hub-submission";
     public const string ManifestFile = "ino-connector.json";
 
-    [GeneratedRegex("^[a-z][a-z0-9-]{1,49}$")] private static partial Regex IdRe();
     [GeneratedRegex("^[0-9a-f]{40}$")] private static partial Regex CommitRe();
     [GeneratedRegex(@"^[^\s@]+@[^\s@]+\.[^\s@]+$")] private static partial Regex EmailRe();
     [GeneratedRegex(@"^(?:ssh://)?git@([^:/]+)[:/](.+?)(?:\.git)?/?$")] private static partial Regex SshRemoteRe();
@@ -40,9 +39,13 @@ public static partial class HubTool
                 throw new CliException(ExitCodes.Usage, "BAD_MANIFEST", $"{ManifestFile}: \"{k}\" must be plain text of at most {max} characters.");
             return v;
         }
-        var m = new Manifest(S("id", 50), S("name", 80), S("kind", 20), S("category", 30), S("platform", 80), S("language", 20), S("version", 40),
+        var m = new Manifest(S("id", ConnectorIds.MaxLength), S("name", 80), S("kind", 20), S("category", 30), S("platform", 80), S("language", 20), S("version", 40),
             S("license", 40), S("repository", 300, required: false), S("description", 2000));
-        if (!IdRe().IsMatch(m.Id)) throw new CliException(ExitCodes.Usage, "BAD_MANIFEST", "\"id\" must look like my-shop-connector.");
+        if (ConnectorIds.Publisher(m.Id) == ConnectorIds.LocalPublisher)
+            throw new CliException(ExitCodes.Usage, "BAD_MANIFEST", "\"id\": local_ ids are for your own environment only; give the connector its own publisher_name to share it.");
+        if (!ConnectorIds.IsValid(m.Id)) throw new CliException(ExitCodes.Usage, "BAD_MANIFEST", "\"id\" must look like my-shop-connector (or publisher_name, e.g. acme_netsuite).");
+        if (ConnectorIds.Publisher(m.Id) is { } pub && ConnectorIds.IsReservedPublisher(pub))
+            throw new CliException(ExitCodes.Usage, "BAD_MANIFEST", $"\"id\": the publisher '{pub}' is reserved for Tryino.");
         if (m.Kind is not ("sales" or "marketing")) throw new CliException(ExitCodes.Usage, "BAD_MANIFEST", "\"kind\" must be sales or marketing.");
         return m;
     }
@@ -144,6 +147,24 @@ public static partial class HubTool
         return o;
     }
 
+    /// <summary>The compatibility part from `ino connector test --kind marketing --json` (codes and pass/fail only; no evidence text).</summary>
+    public static JsonObject MarketingCheck(string file)
+    {
+        if (!File.Exists(file)) throw new CliException(ExitCodes.Usage, "NO_REPORT", $"{file} does not exist.");
+        if (new FileInfo(file).Length > 256 * 1024) throw new CliException(ExitCodes.Usage, "BAD_REPORT", $"{file} is too large to be a contract test report.");
+        JsonObject? root;
+        try { root = JsonNode.Parse(File.ReadAllText(file)) as JsonObject; }
+        catch (System.Text.Json.JsonException) { root = null; }
+        var checks = (root?["checks"] as JsonArray)?.OfType<JsonObject>().ToList();
+        if (checks is not { Count: > 0 }) throw new CliException(ExitCodes.Usage, "BAD_REPORT", $"{file} is not the output of `ino connector test --kind marketing --json`.");
+        return new JsonObject
+        {
+            ["suite"] = "marketing", ["hours"] = 0, ["total"] = checks.Count,
+            ["passed"] = checks.Count(c => c["passed"]?.GetValue<bool>() == true),
+            ["scenarios"] = new JsonArray(checks.Select(c => (JsonNode)new JsonObject { ["code"] = c["code"]?.ToString(), ["passed"] = c["passed"]?.GetValue<bool>() == true }).ToArray()),
+        };
+    }
+
     static string Clip(string s, int max) => s.Trim() is var t && t.Length > max ? t[..max] : s.Trim();
 
     // ---------- catalog ----------
@@ -185,7 +206,8 @@ public static partial class HubTool
     }
 
     /// <summary>Sales connectors only until P1c (Gate T N7).</summary>
-    public static IEnumerable<HubEntry> Listed(HubCatalogPayload p) => p.Entries.Where(e => e.Kind == "sales");
+    /// <summary>Approved connectors: sales connectors and (P1c.2) marketing tools; anything else a future catalog adds is left out.</summary>
+    public static IEnumerable<HubEntry> Listed(HubCatalogPayload p) => p.Entries.Where(e => e.Kind is "sales" or "marketing");
 
     public static string GetCommands(HubEntry e) =>
         $"git clone {e.Mirror} {e.Id}\ncd {e.Id} && git checkout {e.Commit}\n# Tryino approved this exact commit ({e.ApprovedAt:yyyy-MM-dd}). Original repository: {e.Repository}";

@@ -42,7 +42,6 @@ public static partial class HubEnvelope
     public const long MaxVersionJump = 1000;
     static readonly string[] Hosts = ["github.com", "gitlab.com", "dev.azure.com"];
 
-    [GeneratedRegex("^[a-z][a-z0-9-]{1,49}$")] private static partial Regex IdRe();
     [GeneratedRegex("^[0-9a-f]{40}$")] private static partial Regex CommitRe();
     [GeneratedRegex("^[A-Za-z0-9_.-]{1,40}$")] private static partial Regex KeyIdRe();
     // Repository and mirror links are shown and printed as commands: plain path characters only (no newline, ;, $, backtick, quote).
@@ -119,7 +118,7 @@ public static partial class HubEnvelope
             }
             var withdrawn = new List<HubWithdrawal>();
             foreach (var n in (o["withdrawn"] as JsonArray ?? []).Take(MaxEntries))
-                if (n is JsonObject w && Text(w, "id", 50) is { } wid && IdRe().IsMatch(wid))
+                if (n is JsonObject w && Text(w, "id", ConnectorIds.MaxLength) is { } wid && ConnectorIds.IsHubId(wid))
                     withdrawn.Add(new(wid, Text(w, "reason", 500) ?? "", Date(w, "at") ?? DateTimeOffset.MinValue));
             // A withdrawn id never shows in the store, even if an entry with that id is still listed.
             entries.RemoveAll(e => withdrawn.Any(w => w.Id == e.Id));
@@ -140,8 +139,8 @@ public static partial class HubEnvelope
         // A text field that is present but not plain text within its limit drops the whole entry (T5); it is never shown cut or empty.
         foreach (var (field, max) in TextFields)
             if (e[field] is not null && Text(e, field, max) is null) return null;
-        var id = Text(e, "id", 50);
-        if (id is null || !IdRe().IsMatch(id)) return null;
+        var id = Text(e, "id", ConnectorIds.MaxLength);
+        if (id is null || !ConnectorIds.IsHubId(id)) return null;
         var kind = Text(e, "kind", 20);
         if (kind is not ("sales" or "marketing")) return null;
         var runtime = Text(e, "runtime", 20) ?? "self-hosted";

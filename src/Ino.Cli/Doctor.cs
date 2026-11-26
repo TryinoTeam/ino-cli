@@ -15,6 +15,11 @@ public static class Doctor
             checks.Add(new("profile", "ok", $"{r.ProfileName ?? "(environment)"} from {r.Source}; {r.Connection.Environment}; channel {r.Connection.Channel}; {r.Connection.BaseUrl}"));
             checks.Add(new("keychain", "ok", r.ProfileName is null ? "credentials from environment variables" : "key and secret read from the keychain"));
         }
+        catch (CliException e) when (e.Code is "LOGIN_ONLY_PROFILE")
+        {
+            checks.Add(new("profile", "warn", "login only (no channel key): channel checks are skipped. `ino login status` checks the sign-in."));
+            return checks;
+        }
         catch (CliException e) when (e.Code is not "NO_CREDENTIALS")
         {
             checks.Add(new("profile", "fail", e.Message));

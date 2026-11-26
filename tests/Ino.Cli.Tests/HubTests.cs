@@ -38,14 +38,14 @@ public class HubTests
     }
 
     [Fact]
-    public async Task List_verifies_the_catalog_says_test_catalog_and_hides_marketing()
+    public async Task List_verifies_the_catalog_says_test_catalog_and_marks_marketing_tools()
     {
         using var h = WithCatalog(() => Envelope(3, "shop-sync", "mail-bridge"));
         var (code, output, _) = await h.Run("hub", "list");
         Assert.Equal(ExitCodes.Ok, code);
         Assert.Contains("TEST catalog v3", output);
         Assert.Contains("shop-sync", output);
-        Assert.DoesNotContain("mail-bridge", output);
+        Assert.Contains("mail-bridge                  [marketing]", output);   // P1c.2: marketing tools are listed, marked
     }
 
     [Fact]

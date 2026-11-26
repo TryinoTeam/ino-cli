@@ -1,0 +1,13 @@
+{
+  "id": "{{name}}",
+  "name": "{{platform}} marketing tool",
+  "kind": "marketing",
+  "category": "MARKETING",
+  "platform": "{{platform}}",
+  "language": "python",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "repository": "",
+  "contract": 1,
+  "description": "Receives Ino Loyalty's signed activation contract (profiles, events, unsubscribes, deletions) and applies it to {{platform}}."
+}

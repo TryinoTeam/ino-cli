@@ -19,7 +19,8 @@
     <EmbeddedResource Include="../../docs/*.md" LogicalName="docs/%(Filename)%(Extension)" />
     <EmbeddedResource Include="../../skills/*/SKILL.md" LogicalName="skills/%(RecursiveDir)SKILL.md" />
     <!-- MCP/CLI P6a: the store catalog is verified with the same code as the engine (BCL only). -->
-    <!-- Hub/HubEnvelope.cs: shared with the Ino Loyalty engine, which verifies the same catalog. -->
+    <!-- Hub/HubEnvelope.cs: shared with the Ino Loyalty engine. -->
+    <!-- Hub/ConnectorIds.cs: shared with the Ino Loyalty engine. -->
   </ItemGroup>
   <PropertyGroup>
     <DefineConstants>$(DefineConstants);INO_CLI</DefineConstants>

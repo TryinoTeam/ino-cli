@@ -21,6 +21,10 @@ public sealed class CliContext
     public string? WorkingDir { get; init; }
     /// <summary>Runs a command and captures its output (git, for `ino hub submit`); tests replace it.</summary>
     public Func<string, string[], string, (int Code, string Out)>? Capture { get; init; }
+    /// <summary>Opens the sign-in page (`ino login`); tests replace it with a fake browser.</summary>
+    public Func<Uri, Task>? OpenBrowser { get; init; }
+    /// <summary>HTTP handler for Ino Auth's token and revocation endpoints (`ino login/logout`); tests replace it.</summary>
+    public HttpMessageHandler? AuthHandler { get; init; }
     /// <summary>HTTP handler for the store catalog and Tryino's intake (`ino hub`); tests replace it.</summary>
     public HttpMessageHandler? HubHandler { get; init; }
     /// <summary>Runs an external command (claude mcp add-json); tests replace it.</summary>

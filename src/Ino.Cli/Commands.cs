@@ -64,10 +64,11 @@ public static class Commands
             var arr = new JsonArray(cfg.Profiles.Select(p => (JsonNode)new JsonObject
             {
                 ["name"] = p.Key, ["default"] = p.Key == cfg.DefaultProfile, ["baseUrl"] = p.Value.BaseUrl, ["channel"] = p.Value.Channel,
-                ["environment"] = p.Value.Environment, ["key"] = p.Value.KeyHint,
+                ["environment"] = p.Value.Environment, ["key"] = p.Value.KeyHint, ["loginOnly"] = p.Value.SignInOnly,
             }).ToArray());
             Write(ctx, pr.GetValue(json), new JsonObject { ["profiles"] = arr }, cfg.Profiles.Count == 0 ? "No profiles yet. See `ino profile add --help`." :
-                string.Join("\n", cfg.Profiles.Select(p => $"{(p.Key == cfg.DefaultProfile ? "*" : " ")} {p.Key,-16} {p.Value.Environment,-5} {p.Value.Channel,-16} {p.Value.BaseUrl}  key {p.Value.KeyHint}")));
+                string.Join("\n", cfg.Profiles.Select(p => $"{(p.Key == cfg.DefaultProfile ? "*" : " ")} {p.Key,-16} {p.Value.Environment,-5} " +
+                    (p.Value.SignInOnly ? $"{"login only",-16} {p.Value.BaseUrl}" : $"{p.Value.Channel,-16} {p.Value.BaseUrl}  key {p.Value.KeyHint}"))));
             return Task.CompletedTask;
         });
         var useArg = new Argument<string>("name");
@@ -92,12 +93,16 @@ public static class Commands
         profileCmd.Subcommands.Add(set);
         var rmArg = new Argument<string>("name");
         var remove = new Command("remove", "Remove a profile and its keychain entry") { rmArg };
-        Bind(remove, pr =>
+        Bind(remove, async pr =>
         {
-            var had = ctx.Profiles.Remove(pr.GetValue(rmArg)!);
+            var rmName = pr.GetValue(rmArg)!;
+            // The profile's sign-in is ended at Ino too (best effort; offline it expires when unused for 14 days).
+            if (ctx.Profiles.Load().Profiles.TryGetValue(rmName, out var rmProf))
+                try { await InoLogin.LogoutAsync(ctx, rmName, InoLogin.TargetOf(rmProf.BaseUrl), all: false, ct); }
+                catch (Exception e) when (e is CliException or HttpRequestException || e is TaskCanceledException && !ct.IsCancellationRequested) { }
+            var had = ctx.Profiles.Remove(rmName);
             if (!had) throw new CliException(ExitCodes.NotFound, "NO_PROFILE", $"There is no profile named {pr.GetValue(rmArg)}.");
             Write(ctx, pr.GetValue(json), new JsonObject { ["removed"] = pr.GetValue(rmArg) }, $"Removed {pr.GetValue(rmArg)}.");
-            return Task.CompletedTask;
         });
         profileCmd.Subcommands.Add(add); profileCmd.Subcommands.Add(list); profileCmd.Subcommands.Add(use); profileCmd.Subcommands.Add(remove);
         root.Subcommands.Add(profileCmd);
@@ -509,16 +514,44 @@ public static class Commands
         var lang = new Option<string>("--lang") { Description = "node, python or csharp", DefaultValueFactory = _ => "node" };
         var platformOpt = new Option<string>("--platform") { Description = "The system you connect, e.g. \"My shop\"", DefaultValueFactory = _ => "your platform" };
         var cdir = new Option<string?>("--dir") { Description = "Folder to create (default: ./<name>)" };
-        var newCmd = new Command("new", "Create a self-hosted connector project: signed client, retries, webhook receiver, offline queue, health check, Dockerfile") { cname, selfHosted, lang, platformOpt, cdir };
+        var kindOpt = new Option<string>("--kind") { Description = "sales (orders to Ino) or marketing (your marketing tool receives Ino's signed profiles, events, unsubscribes and deletions)", DefaultValueFactory = _ => "sales" };
+        var newCmd = new Command("new", "Create a self-hosted connector project: signed client, retries, webhook receiver, offline queue, health check, Dockerfile") { cname, selfHosted, lang, platformOpt, cdir, kindOpt };
         Bind(newCmd, pr =>
         {
             var name = pr.GetValue(cname)!;
-            var channel = ctx.Profiles.Load() is { DefaultProfile: { } dp } cfg && cfg.Profiles.TryGetValue(pr.GetValue(profile) ?? dp, out var p) ? p.Channel : "YOUR_CHANNEL";
+            var channel = ctx.Profiles.Load() is { DefaultProfile: { } dp } cfg && cfg.Profiles.TryGetValue(pr.GetValue(profile) ?? dp, out var p) && p.Channel.Length > 0 ? p.Channel : "YOUR_CHANNEL";
             var dir = pr.GetValue(cdir) ?? Path.Combine(ctx.WorkingDir ?? Directory.GetCurrentDirectory(), name);
-            var files = ConnectorScaffold.Create(dir, name, pr.GetValue(lang)!, pr.GetValue(platformOpt)!, channel);
-            Write(ctx, pr.GetValue(json), new JsonObject { ["dir"] = dir, ["files"] = new JsonArray(files.Select(f => (JsonNode)f).ToArray()) },
-                $"Created {dir} ({files.Count} files).\nNext: cd {dir} && cp .env.example .env (fill in the test key), {ConnectorScaffold.RunHint(pr.GetValue(lang)!)};\nthen run the scenarios and `ino connector check --suite ecommerce`.");
+            var kind = pr.GetValue(kindOpt)!;
+            var files = ConnectorScaffold.Create(dir, name, pr.GetValue(lang)!, pr.GetValue(platformOpt)!, channel, kind);
+            Write(ctx, pr.GetValue(json), new JsonObject { ["dir"] = dir, ["kind"] = kind, ["files"] = new JsonArray(files.Select(f => (JsonNode)f).ToArray()) }, kind == "marketing"
+                ? $"Created {dir} ({files.Count} files): your marketing tool for Ino Loyalty.\nNext: cd {dir}, `ino marketing connect --name <name> --url https://<host>/ino --env-file ma.env` (or a test secret), copy INO_MA_SIGNING_SECRET into .env, {ConnectorScaffold.MarketingRunHint(pr.GetValue(lang)!)};\nthen `ino connector test --kind marketing --url http://localhost:8080/ino --env-file ma.env` and replace {(pr.GetValue(lang) == "python" ? "connector/tool.py" : "src/tool.js")} with your tool's API."
+                : $"Created {dir} ({files.Count} files).\nNext: cd {dir} && cp .env.example .env (fill in the test key), {ConnectorScaffold.RunHint(pr.GetValue(lang)!)};\nthen run the scenarios and `ino connector check --suite ecommerce`.");
             return Task.CompletedTask;
+        });
+        // MCP/CLI P1c.2: the contract compliance of a marketing tool, run from here against the tool (local while developing, or its https address).
+        var tUrl = new Option<string>("--url") { Description = "The tool's endpoint, e.g. http://localhost:8080/ino", Required = true };
+        var tKind = new Option<string>("--kind") { Description = "marketing", Required = true };
+        var tEnv = new Option<string?>("--env-file") { Description = "The file `ino marketing connect --env-file` wrote (INO_MA_SIGNING_SECRET, INO_MA_CONNECTION_ID); else the INO_MA_SIGNING_SECRET variable" };
+        var tYes = new Option<bool>("--yes") { Description = "Test a tool that is not on this machine (it receives fictional profiles signed with your secret, deleted at the end)" };
+        var ctest = new Command("test", "Check that your marketing tool follows Ino's contract: signatures, ping proof, profiles, events, unsubscribes, deletions") { tUrl, tKind, tEnv, tYes };
+        Bind(ctest, async pr =>
+        {
+            if (pr.GetValue(tKind) != "marketing") throw new CliException(ExitCodes.Usage, "BAD_KIND", "Only --kind marketing is tested here; sales connectors use `ino connector check`.");
+            var target = MarketingCompliance.ValidateTarget(pr.GetValue(tUrl)!);
+            var local = MarketingCompliance.IsLocal(target);
+            if (!local && !pr.GetValue(tYes))
+                throw new CliException(ExitCodes.Usage, "CONFIRM", $"{target.Host} is not this machine: it would receive fictional profiles signed with your secret (deleted at the end). Check the address and add --yes.");
+            var (secret, connectionId) = ReadMarketingSecret(pr.GetValue(tEnv));
+            // As the engine's client: no redirects (Ino never follows one), 30 s per call. A tool on this machine is reached only through loopback.
+            var handler = ctx.LocalHandler ?? (local ? StandardWebhooks.LoopbackOnlyHandler() : new SocketsHttpHandler { AllowAutoRedirect = false, UseProxy = false, UseCookies = false });
+            using var http = new HttpClient(handler, disposeHandler: ctx.LocalHandler is null) { Timeout = TimeSpan.FromSeconds(30) };
+            var checks = await new MarketingCompliance(http, target, secret, connectionId).RunAsync(ct);
+            var lines = checks.Select(c => $"{(c.Passed ? "✓" : "✗")} {c.Code,-4} {c.Title}\n      {c.Evidence}").ToList();
+            var passed = checks.All(c => c.Passed);
+            lines.Add(passed ? $"All {checks.Count} checks passed." : $"{checks.Count(c => !c.Passed)} of {checks.Count} checks failed.");
+            if (local && target.Scheme == "http") lines.Add("Note: tested over local http. Ino itself calls https on a public address only; run `ino marketing verify` after deploying.");
+            Write(ctx, pr.GetValue(json), MarketingCompliance.ToJson(checks), string.Join("\n", lines));
+            if (!passed) exit = ExitCodes.Business;
         });
         var cstatus = new Command("status", "What the engine knows about your self-hosted connectors: version, last heartbeat, health, 24-hour requests and errors");
         Bind(cstatus, async pr =>
@@ -534,10 +567,571 @@ public static class Commands
                 : string.Join("\n", rows.Select(c => $"{c["health"],-9} {c["name"],-24} v{c["version"]}  last seen {c["lastSeen"]}  requests {c["requests24h"]}  errors {c["errors24h"]}  queue {c["queueDepth"]}"
                     + (c["detail"] is { } d ? $"\n          {d}" : ""))));
         });
+        // Ino Hub H1b.2 (docs/INO_HUB.md §19-§22): your own connector definitions (local_*), saved to a test tenant through the Management API.
+        var package = new Command("package", "Your own connector definitions (runs in Ino): save, list, delete, preview, install (test tenants)");
+        var pFile = new Argument<string>("file") { Description = "connector.json (its id starts with local_)" };
+        var packageSave = new Command("save", "Save a version of your own connector definition (the same version with other content is refused: raise the version)") { pFile };
+        Bind(packageSave, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var path = pr.GetValue(pFile)!;
+            if (!File.Exists(path)) throw new CliException(ExitCodes.Usage, "NO_FILE", $"{path} does not exist.");
+            if (new FileInfo(path).Length > 512 * 1024) throw new CliException(ExitCodes.Usage, "TOO_LARGE", "A connector definition is at most 512 KB.");
+            var raw = await File.ReadAllBytesAsync(path, ct);
+            var target = InoLogin.TargetOf(prof.BaseUrl);
+            JsonNode? data = null;
+            // Saving is idempotent on (id, version, content): a dropped connection is simply retried.
+            for (var attempt = 1; ; attempt++)
+            {
+                try { data = await InoLogin.ManageRawAsync(ctx, name, target, "connector-packages", raw, ct); break; }
+                catch (Exception e) when (attempt < 3 && (e is HttpRequestException || e is TaskCanceledException && !ct.IsCancellationRequested || e is CliException { Code: "UNAVAILABLE" or "TEMPORARILY_UNAVAILABLE" }))
+                { await ctx.Delay(TimeSpan.FromSeconds(2 * attempt), ct); }
+            }
+            var created = data?["created"]?.GetValue<bool>() == true;
+            var result = new JsonObject { ["id"] = data?["id"]?.DeepClone(), ["version"] = data?["version"]?.DeepClone(), ["sha256"] = data?["sha256"]?.DeepClone(),
+                ["created"] = created, ["host"] = data?["access"]?["requestHost"]?["defaultHost"]?.DeepClone() };
+            Write(ctx, pr.GetValue(json), result, $"{(created ? "Saved" : "Already saved")} {data?["id"]} {data?["version"]} (sha256 {data?["sha256"]?.ToString()[..12]}…). " +
+                "It is not installed anywhere yet.");
+        });
+        var packageList = new Command("list", "Your own connector definitions in this tenant, with versions and how many installations use each");
+        Bind(packageList, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var data = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Get, "connector-packages", null, null, ct);
+            var rows = data?["packages"]?.AsArray() ?? [];
+            var lines = rows.OfType<JsonObject>().Select(r => $"{r["id"],-30} {r["version"],-10} {r["status"],-12} {r["installations"]} installation(s)  {r["bytes"]} bytes");
+            Write(ctx, pr.GetValue(json), data ?? new JsonObject(), rows.Count == 0 ? "No own connectors saved yet. Save one with `ino connector package save connector.json`." : string.Join("\n", lines));
+        });
+        var pId = new Argument<string>("id") { Description = "The connector id (local_…)" };
+        var pVersion = new Argument<string>("version") { Description = "The version to delete" };
+        var pYes = new Option<bool>("--yes", "-y") { Description = "Delete without asking (a deleted version can never be saved again)" };
+        var packageDelete = new Command("delete", "Delete a version no installation uses (it can never be saved again with that number)") { pId, pVersion, pYes };
+        Bind(packageDelete, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var (id, version) = (pr.GetValue(pId)!, pr.GetValue(pVersion)!);
+            if (!pr.GetValue(pYes))
+                throw new CliException(ExitCodes.Usage, "CONFIRM", $"This deletes {id} {version}; that version number can never be saved again. Run again with --yes to do it.");
+            var data = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Post,
+                $"connector-packages/{Uri.EscapeDataString(id)}/{Uri.EscapeDataString(version)}/delete", new JsonObject(), null, ct);
+            Write(ctx, pr.GetValue(json), data ?? new JsonObject(), data?["alreadyDeleted"]?.GetValue<bool>() == true ? $"{id} {version} was already deleted." : $"Deleted {id} {version}.");
+        });
+        // Ino Hub H1b.1d (docs/INO_HUB.md §25): preview what an installation of your own connector would touch, then install it. Needs the
+        // connector:install scope and the Power Apps "Ino Loyalty - Connector Installer" role (test tenants).
+        var piSet = new Option<string[]>("--set") { Description = "A setting: key=value (repeatable; true/false is yes/no, [\"A\",\"B\"] is a list)", AllowMultipleArgumentsPerToken = false };
+        var piCredential = new Option<Guid?>("--credential") { Description = "Credential id for the connector's calls (Power Apps → Integrations → Credentials)" };
+        var piName = new Option<string?>("--name") { Description = "Installation name (a second installation of the same version needs another name)" };
+        JsonObject InstallBody(ParseResult pr)
+        {
+            var values = new JsonObject();
+            foreach (var item in pr.GetValue(piSet) ?? [])
+            {
+                var eq = item.IndexOf('=');
+                if (eq <= 0) throw new CliException(ExitCodes.Usage, "BAD_SETTING", $"'{item}': use --set key=value.");
+                var (key, text) = (item[..eq].Trim(), item[(eq + 1)..]);
+                JsonNode? value = text switch
+                {
+                    "true" => true,
+                    "false" => false,
+                    _ when text.TrimStart().StartsWith('[') => ParseList(key, text),
+                    _ => text,
+                };
+                values[key] = value;
+            }
+            var body = new JsonObject { ["values"] = values };
+
+            static JsonNode? ParseList(string key, string text)
+            {
+                try { return JsonNode.Parse(text); }
+                catch (JsonException) { throw new CliException(ExitCodes.Usage, "BAD_SETTING", $"'{key}': a list is JSON, e.g. --set {key}='[\"A\",\"B\"]'."); }
+            }
+            if (pr.GetValue(piCredential) is { } credential) body["credentialId"] = credential.ToString();
+            if (pr.GetValue(piName) is { } n) body["name"] = n;
+            return body;
+        }
+        static string AccessText(JsonNode? d)
+        {
+            var a = d?["access"];
+            var lines = new List<string> { $"{d?["id"]} {d?["version"]} (sha256 {d?["sha256"]?.ToString()[..Math.Min(12, d?["sha256"]?.ToString().Length ?? 0)]}…)", $"  calls host      {d?["host"]}" };
+            static IEnumerable<string> Items(JsonNode? n) => n?.AsArray().Select(x => x?.ToString() ?? "") ?? [];
+            if (a?["events"]?.AsArray() is { Count: > 0 } events) lines.Add($"  receives        {string.Join(", ", Items(events))}");
+            foreach (var x in a?["actions"]?.AsArray() ?? []) lines.Add($"  sends           {x?["method"]} {x?["path"]} on {string.Join(", ", Items(x?["events"]))}");
+            foreach (var x in a?["writes"]?.AsArray() ?? [])
+                lines.Add($"  writes          {x?["operation"]}{(x?["financial"]?.GetValue<bool>() == true ? " (points or money)" : "")}{(x?["profile"]?.GetValue<bool>() == true ? " (member profile)" : "")}");
+            if (a?["reads"]?.AsArray() is { Count: > 0 } reads) lines.Add($"  reads           {string.Join(", ", Items(reads))}");
+            foreach (var x in a?["memberMatch"]?.AsArray() ?? []) lines.Add($"  finds members   by {string.Join(", ", Items(x?["by"]))} (if missing: {x?["ifMissing"]})");
+            if (a?["webhooks"]?.GetValue<bool>() == true) lines.Add("  inbound         webhooks from the platform");
+            if (a?["pollMinutes"] is { } poll) lines.Add($"  inbound         polls every {poll} minutes");
+            if (d?["channels"]?.AsArray() is { Count: > 0 } ch) lines.Add($"  channels        {string.Join(", ", Items(ch))}");
+            lines.Add($"  access hash     {d?["accessHash"]}");
+            return string.Join("\n", lines);
+        }
+        string PackagePath(string id, string version, string verb) => $"connector-packages/{Uri.EscapeDataString(id)}/{Uri.EscapeDataString(version)}/{verb}";
+
+        var piId = new Argument<string>("id") { Description = "The connector id (local_…)" };
+        var piVersion = new Argument<string>("version") { Description = "The saved version" };
+        var packagePreview = new Command("preview", "What installing a saved version would touch, with your settings (nothing is installed)") { piId, piVersion, piSet, piCredential, piName };
+        Bind(packagePreview, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var data = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Post, PackagePath(pr.GetValue(piId)!, pr.GetValue(piVersion)!, "preview"),
+                InstallBody(pr), null, ct);
+            Write(ctx, pr.GetValue(json), data ?? new JsonObject(), AccessText(data) + $"\nInstall it with `ino connector package install {pr.GetValue(piId)} {pr.GetValue(piVersion)} … --yes`.");
+        });
+        var piYes = new Option<bool>("--yes", "-y") { Description = "Install after showing what it touches (without it, only the summary is shown)" };
+        var packageInstall = new Command("install", "Install a saved version of your own connector on this test tenant (shows what it touches; --yes installs)")
+            { piId, piVersion, piSet, piCredential, piName, piYes };
+        Bind(packageInstall, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var target = InoLogin.TargetOf(prof.BaseUrl);
+            var (id, version) = (pr.GetValue(piId)!, pr.GetValue(piVersion)!);
+            var body = InstallBody(pr);
+            var preview = await InoLogin.ManageAsync(ctx, name, target, HttpMethod.Post, PackagePath(id, version, "preview"), body.DeepClone(), null, ct);
+            var summary = AccessText(preview);
+            if (!pr.GetValue(piYes))
+                throw new CliException(ExitCodes.Usage, "CONFIRM", summary + "\nNothing was installed. Run again with --yes to install it with exactly this access.");
+            body["accessHash"] = preview?["accessHash"]?.DeepClone() ?? throw new CliException(ExitCodes.Business, "NO_PREVIEW", "Ino returned no access summary.");
+            // §25 M5: the same request always has the same Idempotency-Key, so running the command again (after a crash or a dropped connection)
+            // returns the first installation instead of making a second one.
+            var idempotency = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(
+                $"ino-package-install|{target.Tenant}|{id}|{version}|{body.ToJsonString()}")));
+            JsonNode? data = null;
+            for (var attempt = 1; ; attempt++)
+            {
+                try { data = await InoLogin.ManageAsync(ctx, name, target, HttpMethod.Post, PackagePath(id, version, "install"), body, idempotency, ct); break; }
+                catch (Exception e) when (attempt < 3 && (e is HttpRequestException || e is TaskCanceledException && !ct.IsCancellationRequested
+                    || e is CliException { Code: "UNAVAILABLE" or "TEMPORARILY_UNAVAILABLE" or "IN_PROGRESS" }))
+                { await ctx.Delay(TimeSpan.FromSeconds(2 * attempt), ct); }
+            }
+            var created = data?["created"]?.GetValue<bool>() == true && data?["replayed"]?.GetValue<bool>() != true;
+            Write(ctx, pr.GetValue(json), data ?? new JsonObject(), summary + "\n" + (created
+                ? $"Installed {id} {version} as {data?["id"]}."
+                : $"Already installed: {data?["id"]} (the same request was installed before)."));
+        });
+        package.Subcommands.Add(packageSave);
+        package.Subcommands.Add(packageList);
+        package.Subcommands.Add(packageDelete);
+        package.Subcommands.Add(packagePreview);
+        package.Subcommands.Add(packageInstall);
+        connector.Subcommands.Add(package);
         connector.Subcommands.Add(check);
         connector.Subcommands.Add(newCmd);
         connector.Subcommands.Add(cstatus);
+        connector.Subcommands.Add(ctest);
         root.Subcommands.Add(connector);
+
+        // ---------------------------------------------------------------- login (MCP/CLI P0c.1c: Ino Auth, a person instead of a channel key)
+        JsonObject Who(InoLogin.Target target, InoLogin.Session s) => new()
+        {
+            ["tenant"] = s.Claims["ino_tenant"]?.DeepClone() ?? target.Tenant, ["environment"] = s.Claims["ino_env"]?.DeepClone(),
+            ["name"] = s.Claims["name"]?.DeepClone(), ["objectId"] = s.Claims["oid"]?.DeepClone(), ["scopes"] = s.Claims["scope"]?.DeepClone(),
+            ["expires"] = s.Claims["exp"] is { } exp ? DateTimeOffset.FromUnixTimeSeconds(exp.GetValue<long>()).ToString("u") : null,
+        };
+        string Human(JsonObject w) => $"{w["name"]} · tenant {w["tenant"]} ({w["environment"]}) · scopes: {w["scopes"]}";
+        var loginScopes = new Option<string>("--scopes") { Description = "Scopes to ask for (space separated)", DefaultValueFactory = _ => InoLogin.DefaultScopes };
+        var loginBase = new Option<string?>("--base-url") { Description = "Ino Cloud address, e.g. https://api.inoloyalty.com/t/<tenant>: makes a sign-in-only profile (no channel key) named after the tenant or --profile" };
+        var login = new Command("login", "Sign in as yourself (Microsoft account of the tenant) for the profile's tenant; the refresh token stays in the keychain") { loginScopes, loginBase };
+        Bind(login, async pr =>
+        {
+            var address = pr.GetValue(loginBase);
+            // Only the flags name a new profile: INO_PROFILE and a repository's .ino/config.json never choose or create one here (M3).
+            var name = address is not null ? pr.GetValue(profile) ?? InoLogin.TargetOf(address).Tenant : ctx.Profiles.ResolveForLogin(pr.GetValue(profile)).Name;
+            if (address is not null)
+                try { address = ctx.Profiles.CheckLoginAddress(name, address); }
+                catch (CliException e) when (e.Code == "BAD_PROFILE_NAME" && pr.GetValue(profile) is null)
+                {
+                    throw new CliException(ExitCodes.Usage, "BAD_PROFILE_NAME", $"The tenant code {name} cannot be a profile name; pass --profile <name> (letters, digits, - and _).");
+                }
+            var target = InoLogin.TargetOf(address ?? ctx.Profiles.ResolveForLogin(name).Profile.BaseUrl);
+            ctx.Profiles.ProbeLoginStore(name);
+            var s = await InoLogin.LoginAsync(ctx, target, pr.GetValue(loginScopes)!, ct);
+            var created = false;
+            try
+            {
+                if (address is not null) created = ctx.Profiles.EnsureLoginOnly(name, address);
+                await InoLogin.SaveAsync(ctx, name, target, s, ct);
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                await InoLogin.RevokeAsync(ctx, target, s.RefreshToken, CancellationToken.None);   // not kept anywhere: end it at Ino
+                throw;
+            }
+            var w = Who(target, s);
+            Write(ctx, pr.GetValue(json), w, $"Signed in: {Human(w)}" + (created ? $"\nSaved profile {name} (sign-in only; the refresh token is in the keychain)." : ""));
+        });
+        var loginStatus = new Command("status", "Who you are signed in as for this profile (refreshes the sign-in)");
+        Bind(loginStatus, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var target = InoLogin.TargetOf(prof.BaseUrl);
+            var s = await InoLogin.RefreshAsync(ctx, name, target, ct) ?? throw new CliException(ExitCodes.Auth, "NOT_SIGNED_IN", "Not signed in for this profile. Run `ino login`.");
+            var w = Who(target, s);
+            Write(ctx, pr.GetValue(json), w, "Signed in: " + Human(w));
+        });
+        login.Subcommands.Add(loginStatus);
+        root.Subcommands.Add(login);
+        var logoutAll = new Option<bool>("--all") { Description = "End every session you have in this tenant (other machines and AI agents too)" };
+        var logout = new Command("logout", "End your sign-in for this profile (ended at Ino, removed from the keychain)") { logoutAll };
+        Bind(logout, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var all = pr.GetValue(logoutAll);
+            var r = await InoLogin.LogoutAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), all, ct);
+            var text = !r.WasSignedIn ? "Not signed in for this profile."
+                : all ? $"Signed out. {r.Ended ?? 0} session(s) of yours in this tenant ended; access stops within a minute."
+                : r.Note is { } note ? "Signed out here. " + note : "Signed out.";
+            Write(ctx, pr.GetValue(json), new JsonObject { ["signedOut"] = r.WasSignedIn, ["ended"] = r.Ended, ["note"] = r.Note }, text);
+        });
+        root.Subcommands.Add(logout);
+        var sessions = new Command("sessions", "Your Ino sign-ins in this tenant (this and other machines, AI agents); end them with `ino logout --all`");
+        Bind(sessions, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var list = await InoLogin.SessionsAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), ct);
+            static string D(JsonNode? n) => n?.GetValue<DateTimeOffset>().ToLocalTime().ToString("yyyy-MM-dd HH:mm", System.Globalization.CultureInfo.InvariantCulture) ?? "-";
+            var lines = list.Select(n => $"{(n?["current"]?.GetValue<bool>() == true ? "* " : "  ")}{n?["id"]}  started {D(n?["started"])}  last refresh {D(n?["lastRefresh"])}  " +
+                $"expires if unused {D(n?["expiresIfUnused"])}  {string.Join(" ", n?["scopes"]?.AsArray().Select(x => x?.GetValue<string>()) ?? [])}");
+            Write(ctx, pr.GetValue(json), new JsonObject { ["sessions"] = list.DeepClone() },
+                list.Count == 0 ? "No open sessions." : string.Join("\n", lines) + "\n(* this profile)");
+        });
+        root.Subcommands.Add(sessions);
+
+        // ---------------------------------------------------------------- channels / keys (MCP/CLI P0c.3: Management API as the signed-in person)
+        var channelsCmd = new Command("channels", "Channels of this tenant (as you see them in Power Apps → Developers); needs `ino login`");
+        var channelsList = new Command("list", "List channels: mapping, allowed operations, active keys, traffic in the last 24 hours");
+        Bind(channelsList, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var data = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Get, "channels", null, null, ct);
+            var rows = data?["channels"]?.AsArray() ?? [];
+            Write(ctx, pr.GetValue(json), new JsonObject { ["channels"] = rows.DeepClone() }, rows.Count == 0 ? "No channels." : string.Join("\n", rows.Select(c =>
+                $"{c?["code"],-18} {(c?["hasMapping"]?.GetValue<bool>() == true ? "mapped  " : "no map  ")} keys {c?["activeKeys"],-3} requests 24h {c?["requests24h"]} (failed {c?["failed24h"]})")));
+        });
+        channelsCmd.Subcommands.Add(channelsList);
+        root.Subcommands.Add(channelsCmd);
+
+        var keysCmd = new Command("keys", "API keys of this tenant's channels; needs `ino login` (creating needs the integration:write scope, test tenants)");
+        var keysList = new Command("list", "List API keys (prefix, channel, status, last use); secrets are never shown again");
+        Bind(keysList, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var data = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Get, "api-keys", null, null, ct);
+            var rows = data?["keys"]?.AsArray() ?? [];
+            Write(ctx, pr.GetValue(json), new JsonObject { ["keys"] = rows.DeepClone() }, rows.Count == 0 ? "No API keys." : string.Join("\n", rows.Select(k =>
+                $"{k?["keyPrefix"],-12} {k?["id"],-36} {k?["channel"],-18} {k?["status"],-8} {k?["name"]}  last used {k?["lastUsedAt"]?.ToString() ?? "never"}")));
+        });
+        var kChannel = new Option<string>("--channel") { Description = "Channel code (see `ino channels list`)", Required = true };
+        var kName = new Option<string>("--name") { Description = "What the key is for, e.g. \"Store POS fleet\"", Required = true };
+        var kDescription = new Option<string?>("--description") { Description = "Longer note shown in Power Apps" };
+        var kScopes = new Option<string?>("--scopes") { Description = "Operations the key may call, comma separated (e.g. transaction.create,member.get)" };
+        var kFull = new Option<bool>("--full-access") { Description = "Every operation of the channel (instead of --scopes)" };
+        var kExpires = new Option<DateTimeOffset?>("--expires") { Description = "Expiry date (e.g. 2027-06-30)" };
+        var kSave = new Option<string?>("--save-profile") { Description = "Store the key and secret in the keychain as a new channel profile with this name (recommended)" };
+        var kEnv = new Option<string?>("--env-file") { Description = "Write INO_BASE_URL, INO_CHANNEL, INO_ENVIRONMENT, INO_API_KEY and INO_HMAC_SECRET to this new file (mode 0600; an existing file is not overwritten), the names the connector templates and the CLI read" };
+        var kShow = new Option<bool>("--show-secret") { Description = "Print the key and secret here (they end up in your terminal history or an AI agent's transcript)" };
+        var keysCreate = new Command("create", "Create an API key for a channel (test tenants). The secret is shown once: keep it with --save-profile, --env-file or --show-secret")
+            { kChannel, kName, kDescription, kScopes, kFull, kExpires, kSave, kEnv, kShow };
+        Bind(keysCreate, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var dest = new SecretDestinations(pr.GetValue(kSave), pr.GetValue(kEnv), pr.GetValue(kShow), null);
+            CheckDestinations(dest, pr.GetValue(kChannel)!, prof, null);
+            var scopes = pr.GetValue(kScopes)?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var body = new JsonObject
+            {
+                ["channel"] = pr.GetValue(kChannel), ["name"] = pr.GetValue(kName), ["description"] = pr.GetValue(kDescription),
+                ["scopes"] = scopes is null ? null : new JsonArray(scopes.Select(x => (JsonNode)x).ToArray()), ["fullAccess"] = pr.GetValue(kFull),
+                ["expiresAt"] = pr.GetValue(kExpires)?.ToString("O"),
+            };
+            var data = await KeyWrite(name, InoLogin.TargetOf(prof.BaseUrl), "api-keys", body,
+                "Ino did not confirm the key. It may have been issued: check `ino keys list` and revoke a key you did not get in Power Apps.");
+            var (apiKey, secret, channelCode) = Issued(data, pr.GetValue(kChannel)!);
+            var kept = KeepSecret(dest, prof, channelCode, apiKey, secret);
+            var result = new JsonObject { ["id"] = data?["id"]?.DeepClone(), ["channel"] = channelCode, ["keyPrefix"] = data?["keyPrefix"]?.DeepClone(),
+                ["savedTo"] = new JsonArray(kept.Select(x => (JsonNode)x).ToArray()) };
+            if (dest.Show) { result["apiKey"] = apiKey; result["secret"] = secret; }
+            Write(ctx, pr.GetValue(json), result, $"Created API key {data?["keyPrefix"]} for {channelCode}." +
+                (kept.Count > 0 ? " Saved to " + string.Join(" and ", kept) + "." : "") +
+                (dest.Show ? $"\nAPI key: {apiKey}\nSigning secret: {secret}\nThis is the only time the secret is shown." : ""));
+        });
+
+        // ---- keys rotate / revoke (docs/MCP_CLI_P0C.md §2.6)
+        var rKey = new Argument<string>("key") { Description = "The key's id or prefix (see `ino keys list`)" };
+        var rOverlap = new Option<int>("--overlap-hours") { Description = "How long the old key keeps working: 0 (stops now) to 168; default 24", DefaultValueFactory = _ => 24 };
+        var rSave = new Option<string?>("--save-profile") { Description = "Store the new key and secret in the keychain as a new channel profile with this name" };
+        var rEnv = new Option<string?>("--env-file") { Description = "Write INO_BASE_URL, INO_CHANNEL, INO_ENVIRONMENT, INO_API_KEY and INO_HMAC_SECRET to this new file (mode 0600)" };
+        var rShow = new Option<bool>("--show-secret") { Description = "Print the new key and secret here" };
+        var rUpdate = new Option<string?>("--update-profile") { Description = "The channel profile that holds the old key gets the new key and secret (recommended)" };
+        var keysRotate = new Command("rotate", "Replace an API key with a new one (test tenants); the old key keeps working for --overlap-hours. The new secret is shown once")
+            { rKey, rOverlap, rUpdate, rSave, rEnv, rShow };
+        Bind(keysRotate, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var target = InoLogin.TargetOf(prof.BaseUrl);
+            if (pr.GetValue(rOverlap) is < 0 or > 168) throw new CliException(ExitCodes.Usage, "USAGE", "--overlap-hours is between 0 and 168.");
+            var dest = new SecretDestinations(pr.GetValue(rSave), pr.GetValue(rEnv), pr.GetValue(rShow), pr.GetValue(rUpdate));
+            if (dest.Save is null && dest.EnvFile is null && !dest.Show && dest.Update is null)
+                throw new CliException(ExitCodes.Usage, "NO_SECRET_DESTINATION", "The new secret is shown only once. Choose where it goes: --update-profile <name>, --save-profile <name>, --env-file <path> or --show-secret.");
+            var key = await FindKey(name, target, pr.GetValue(rKey)!, revoking: false);
+            var channel = key["channel"]!.GetValue<string>();
+            CheckDestinations(dest, channel, prof, key["keyPrefix"]!.GetValue<string>());
+            var data = await KeyWrite(name, target, $"api-keys/{key["id"]}/rotate", new JsonObject { ["overlapHours"] = pr.GetValue(rOverlap) },
+                "Ino did not confirm the rotation. A new key may have been issued: check `ino keys list`.");
+            var (apiKey, secret, channelCode) = Issued(data, channel);
+            var kept = KeepSecret(dest, prof, channelCode, apiKey, secret);
+            var until = data?["previousValidUntil"]?.GetValue<DateTimeOffset?>();
+            var result = new JsonObject { ["id"] = data?["id"]?.DeepClone(), ["channel"] = channelCode, ["keyPrefix"] = data?["keyPrefix"]?.DeepClone(),
+                ["previousKeyPrefix"] = key["keyPrefix"]?.DeepClone(), ["previousValidUntil"] = until?.ToString("O"), ["savedTo"] = new JsonArray(kept.Select(x => (JsonNode)x).ToArray()) };
+            if (dest.Show) { result["apiKey"] = apiKey; result["secret"] = secret; }
+            Write(ctx, pr.GetValue(json), result, $"Rotated {key["keyPrefix"]}: the new key is {data?["keyPrefix"]}. " +
+                (until is { } u ? $"The old key works until {u.ToLocalTime():yyyy-MM-dd HH:mm}." : "The old key stopped working.") +
+                (kept.Count > 0 ? " Saved to " + string.Join(" and ", kept) + "." : "") +
+                (dest.Show ? $"\nAPI key: {apiKey}\nSigning secret: {secret}\nThis is the only time the secret is shown." : ""));
+        });
+        var vReason = new Option<string?>("--reason") { Description = "Why (shown in Power Apps → Developers, at most 200 characters)" };
+        var vYes = new Option<bool>("--yes", "-y") { Description = "Revoke without asking (requests with the key are refused from now on)" };
+        var keysRevoke = new Command("revoke", "Revoke an API key (test tenants): requests with it are refused at once. Revoking a replacement does not stop the old key during its overlap")
+            { rKey, vReason, vYes };
+        Bind(keysRevoke, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var target = InoLogin.TargetOf(prof.BaseUrl);
+            var key = await FindKey(name, target, pr.GetValue(rKey)!, revoking: true);
+            var label = $"{key["keyPrefix"]} ({key["name"]}, {key["channel"]})";
+            if (!pr.GetValue(vYes))
+                throw new CliException(ExitCodes.Usage, "CONFIRM", $"This revokes {label}; requests with it are refused at once. Run again with --yes to do it.");
+            await KeyWrite(name, target, $"api-keys/{key["id"]}/revoke", new JsonObject { ["reason"] = pr.GetValue(vReason) },
+                "Ino did not confirm the revocation. Check `ino keys list` and try again.");
+            Write(ctx, pr.GetValue(json), new JsonObject { ["revoked"] = key["id"]?.DeepClone(), ["keyPrefix"] = key["keyPrefix"]?.DeepClone() }, $"Revoked {label}.");
+        });
+
+        // Key lookup for rotate/revoke: an id, an exact prefix or the full key (never part of a prefix); revoke only sees keys not revoked yet.
+        async Task<JsonObject> FindKey(string name, InoLogin.Target target, string wanted, bool revoking)
+        {
+            wanted = wanted.Trim();
+            var rows = (await InoLogin.ManageAsync(ctx, name, target, HttpMethod.Get, "api-keys", null, null, ct))?["keys"]?.AsArray() ?? [];
+            var prefix = Guid.TryParse(wanted, out _) ? null : wanted.Length > 20 ? ProfileStore.KeyPrefix(wanted) : wanted;
+            var matches = rows.OfType<JsonObject>().Where(k => prefix is null
+                    ? string.Equals(k["id"]?.ToString(), wanted, StringComparison.OrdinalIgnoreCase)
+                    : k["keyPrefix"]?.ToString() == prefix)
+                .Where(k => !revoking || k["status"]?.ToString() != "REVOKED").ToList();
+            return matches.Count switch
+            {
+                1 => matches[0],
+                0 => throw new CliException(ExitCodes.NotFound, "NO_KEY", $"No {(revoking ? "unrevoked " : "")}API key matches {(prefix is null ? wanted : prefix)}. See `ino keys list`."),
+                _ => throw new CliException(ExitCodes.Usage, "AMBIGUOUS", $"{matches.Count} keys match {prefix}; give the id: {string.Join(", ", matches.Select(k => k["id"]))}."),
+            };
+        }
+
+        // B1/K3: dropped connections, timeouts, 5xx and "still running" are retried with the same Idempotency-Key, which returns the first
+        // attempt's result (never a second key).
+        async Task<JsonNode?> KeyWrite(string name, InoLogin.Target target, string path, JsonNode body, string uncertain, string? idempotencyKey = null)
+        {
+            var idempotency = idempotencyKey ?? Guid.NewGuid().ToString("N");
+            for (var attempt = 1; ; attempt++)
+            {
+                try { return await InoLogin.ManageAsync(ctx, name, target, HttpMethod.Post, path, body, idempotency, ct); }
+                catch (Exception e) when (attempt < 3 && Retryable(e)) { await ctx.Delay(TimeSpan.FromSeconds(2 * attempt), ct); }
+                catch (Exception e) when (Retryable(e)) { throw new CliException(ExitCodes.Network, "UNCERTAIN", uncertain); }
+            }
+            bool Retryable(Exception e) => e is HttpRequestException || e is TaskCanceledException && !ct.IsCancellationRequested
+                || e is CliException { Code: "UNAVAILABLE" or "TEMPORARILY_UNAVAILABLE" or "IN_PROGRESS" };
+        }
+
+        static (string ApiKey, string Secret, string Channel) Issued(JsonNode? data, string channel) => (
+            data?["apiKey"]?.GetValue<string>() ?? throw new CliException(ExitCodes.Business, "NO_KEY", "Ino returned no key."),
+            data?["secret"]?.GetValue<string>() ?? throw new CliException(ExitCodes.Business, "NO_KEY", "Ino returned no secret."),
+            data?["channel"]?.GetValue<string>() ?? channel);
+
+        // K4/K5: every check that could fail after the key is issued runs before it is asked for.
+        void CheckDestinations(SecretDestinations d, string channel, Profile prof, string? oldPrefix)
+        {
+            if (d.Save is null && d.EnvFile is null && !d.Show && d.Update is null)
+                throw new CliException(ExitCodes.Usage, "NO_SECRET_DESTINATION", "The secret is shown only once. Choose where it goes: --save-profile <name>, --env-file <path> or --show-secret.");
+            if (d.Save is not null)
+            {
+                ProfileStore.ValidateName(d.Save);
+                if (ctx.Profiles.Load().Profiles.ContainsKey(d.Save))
+                    throw new CliException(ExitCodes.Usage, "PROFILE_EXISTS", $"A profile named {d.Save} exists; choose a new name (its key is not replaced).");
+                ChannelClient.ValidateChannel(channel);
+            }
+            if (d.Update is not null) ctx.Profiles.CheckKeyProfile(d.Update, prof.BaseUrl, channel, oldPrefix!);
+            if (d.EnvFile is not null)
+            {
+                if (File.Exists(d.EnvFile)) throw new CliException(ExitCodes.Usage, "FILE_EXISTS", $"{d.EnvFile} exists; choose a new file.");
+                if (Path.GetDirectoryName(Path.GetFullPath(d.EnvFile)) is { } dir && !Directory.Exists(dir))
+                    throw new CliException(ExitCodes.Usage, "NO_FOLDER", $"The folder {dir} does not exist.");
+            }
+        }
+
+        List<string> KeepSecret(SecretDestinations d, Profile prof, string channelCode, string apiKey, string secret)
+        {
+            var kept = new List<string>();
+            var failed = new List<string>();
+            if (d.Update is not null)
+                try { ctx.Profiles.ReplaceCredentials(d.Update, apiKey, secret); kept.Add($"profile {d.Update}"); }
+                catch (Exception e) when (e is not OperationCanceledException) { failed.Add($"profile {d.Update}: {e.Message}"); }
+            if (d.Save is not null)
+                try
+                {
+                    ctx.Profiles.Add(d.Save, prof.BaseUrl, channelCode, "test", apiKey, secret, makeDefault: false);
+                    ctx.Profiles.PreferAsDefault(d.Save);
+                    kept.Add($"profile {d.Save} (keychain)");
+                }
+                catch (Exception e) when (e is not OperationCanceledException) { failed.Add($"profile {d.Save}: {e.Message}"); }
+            if (d.EnvFile is not null)
+                try
+                {
+                    var opts = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
+                    if (!OperatingSystem.IsWindows()) opts.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+                    using (var fs = new FileStream(d.EnvFile, opts)) using (var f = new StreamWriter(fs, new System.Text.UTF8Encoding(false))) f.Write($"INO_BASE_URL={prof.BaseUrl}\nINO_CHANNEL={channelCode}\nINO_ENVIRONMENT=test\nINO_API_KEY={apiKey}\nINO_HMAC_SECRET={secret}\n");
+                    kept.Add($"{d.EnvFile} (mode 0600)");
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException) { failed.Add($"{d.EnvFile}: {e.Message}"); }
+            // K5: a key whose secret reached nowhere is lost; say so loudly and hand the secret over once on stderr.
+            if (kept.Count == 0 && !d.Show)
+            {
+                ctx.Err.WriteLine($"warning: the key was issued but could not be saved ({string.Join("; ", failed)}). Keep these now; they are not shown again:");
+                ctx.Err.WriteLine($"INO_API_KEY={apiKey}");
+                ctx.Err.WriteLine($"INO_HMAC_SECRET={secret}");
+            }
+            else foreach (var f in failed) ctx.Err.WriteLine("warning: not saved to " + f);
+            return kept;
+        }
+
+        keysCmd.Subcommands.Add(keysList);
+        keysCmd.Subcommands.Add(keysCreate);
+        keysCmd.Subcommands.Add(keysRotate);
+        keysCmd.Subcommands.Add(keysRevoke);
+        root.Subcommands.Add(keysCmd);
+
+        // ---------------------------------------------------------------- marketing (MCP/CLI P1c.1: your own marketing tool)
+        var marketing = new Command("marketing", "Marketing Activation connections; connect a marketing tool you run yourself (test tenants; needs `ino login`)");
+        var mList = new Command("list", "Marketing connections of this tenant with their status");
+        Bind(mList, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var data = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Get, "marketing/connections", null, null, ct);
+            var rows = data?["connections"]?.AsArray() ?? [];
+            Write(ctx, pr.GetValue(json), new JsonObject { ["connections"] = rows.DeepClone() }, rows.Count == 0 ? "No marketing connections." : string.Join("\n", rows.Select(c =>
+                $"{c?["id"],-36} {c?["type"],-8} {c?["status"],-16} {c?["name"]}  {c?["account"]}")));
+        });
+        var mName = new Option<string>("--name") { Description = "A name for the connection, e.g. \"Our CRM mailer\"", Required = true };
+        var mUrl = new Option<string>("--url") { Description = "Your tool's https address; Ino posts every signed request there", Required = true };
+        var mEnv = new Option<string?>("--env-file") { Description = "Write INO_MA_CONNECTION_ID and INO_MA_SIGNING_SECRET to this new file (mode 0600; an existing file is not overwritten)" };
+        var mShow = new Option<bool>("--show-secret") { Description = "Print the signing secret here (it ends up in your terminal history or an AI agent's transcript)" };
+        var mConnect = new Command("connect", "Add your own marketing tool. Ino signs every call with a new secret, shown once: keep it with --env-file or --show-secret. Then run `ino marketing verify`")
+            { mName, mUrl, mEnv, mShow };
+        Bind(mConnect, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var envFile = pr.GetValue(mEnv);
+            var show = pr.GetValue(mShow);
+            if (envFile is null && !show)
+                throw new CliException(ExitCodes.Usage, "NO_SECRET_DESTINATION", "The signing secret is shown only once. Choose where it goes: --env-file <path> or --show-secret.");
+            if (envFile is not null)
+            {
+                if (File.Exists(envFile)) throw new CliException(ExitCodes.Usage, "FILE_EXISTS", $"{envFile} exists; choose a new file.");
+                if (Path.GetDirectoryName(Path.GetFullPath(envFile)) is { } dir && !Directory.Exists(dir))
+                    throw new CliException(ExitCodes.Usage, "NO_FOLDER", $"The folder {dir} does not exist.");
+            }
+            var body = new JsonObject { ["name"] = pr.GetValue(mName), ["url"] = pr.GetValue(mUrl) };
+            // The same command always sends the same Idempotency-Key (Gate K 3): running it again after an uncertain answer returns the first connection
+            // and its secret (to the same person) instead of opening a second one.
+            var stableKey = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(
+                $"ino-marketing-connect|{prof.BaseUrl}|{pr.GetValue(mName)}|{pr.GetValue(mUrl)}")));
+            var data = await KeyWrite(name, InoLogin.TargetOf(prof.BaseUrl), "marketing/connections", body,
+                "Ino did not confirm the connection. Run the same command again: it returns the same connection and secret.", stableKey);
+            var id = data?["connectionId"]?.ToString() ?? throw new CliException(ExitCodes.Business, "NO_CONNECTION", "Ino returned no connection.");
+            var secret = data?["secret"]?.GetValue<string>() ?? throw new CliException(ExitCodes.Business, "NO_SECRET", "Ino returned no signing secret.");
+            var kept = new List<string>();
+            if (envFile is not null)
+                try
+                {
+                    var opts = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
+                    if (!OperatingSystem.IsWindows()) opts.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+                    using (var fs = new FileStream(envFile, opts)) using (var f = new StreamWriter(fs, new System.Text.UTF8Encoding(false)))
+                        f.Write($"INO_MA_CONNECTION_ID={id}\nINO_MA_SIGNING_SECRET={secret}\n");
+                    kept.Add($"{envFile} (mode 0600)");
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    // The connection exists; a secret that reached nowhere is lost, so it is handed over once on stderr.
+                    ctx.Err.WriteLine($"warning: the secret could not be written to {envFile} ({e.Message}). Keep it now; it is not shown again:");
+                    ctx.Err.WriteLine($"INO_MA_SIGNING_SECRET={secret}");
+                }
+            var result = new JsonObject { ["connectionId"] = id, ["name"] = data?["name"]?.DeepClone(), ["host"] = data?["host"]?.DeepClone(), ["status"] = data?["status"]?.DeepClone(),
+                ["savedTo"] = new JsonArray(kept.Select(x => (JsonNode)x).ToArray()) };
+            if (show) result["secret"] = secret;
+            Write(ctx, pr.GetValue(json), result, $"Added {data?["name"]} ({data?["host"]}) as {id}; nothing is sent until it is verified." +
+                (kept.Count > 0 ? " Secret saved to " + string.Join(" and ", kept) + "." : "") +
+                (show ? $"\nSigning secret: {secret}\nThis is the only time it is shown." : "") +
+                $"\nWhen your tool answers the ping, run: ino marketing verify {id}");
+        });
+        var mId = new Argument<Guid>("connection-id") { Description = "The connection's id (see `ino marketing list`)" };
+        var mVerify = new Command("verify", "Send a signed ping to your tool; it connects when the tool answers with the challenge and its proof (also reconnects a disconnected one)") { mId };
+        Bind(mVerify, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var id = pr.GetValue(mId);
+            var data = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Post, $"marketing/connections/{id:D}/verify", new JsonObject(), null, ct);
+            var ok = data?["connected"]?.GetValue<bool>() == true;
+            var output = new JsonObject { ["connectionId"] = id.ToString("D"), ["connected"] = ok, ["status"] = data?["status"]?.DeepClone(), ["error"] = data?["error"]?.DeepClone(),
+                ["capabilities"] = data?["capabilities"]?.DeepClone() };
+            if (!ok)
+                throw new CliException(ExitCodes.Business, "NOT_VERIFIED", $"Your tool did not pass the check ({data?["error"]}); nothing is sent to it.",
+                    VerifyHint(data?["error"]?.ToString()));
+            Write(ctx, pr.GetValue(json), output, $"Verified: the connection is {data?["status"]?.ToString().ToLowerInvariant()}. Ino now sends profiles, events, unsubscribes and deletions to it.");
+        });
+        var mYes = new Option<bool>("--yes") { Description = "Disconnect without asking" };
+        var mDisconnect = new Command("disconnect", "Stop sending to a marketing connection (an own tool keeps its address and secret; `verify` reconnects it)") { mId, mYes };
+        Bind(mDisconnect, async pr =>
+        {
+            if (!pr.GetValue(mYes)) throw new CliException(ExitCodes.Usage, "CONFIRM", "Add --yes to disconnect: nothing more is sent to the tool.");
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var id = pr.GetValue(mId);
+            var data = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Post, $"marketing/connections/{id:D}/disconnect", new JsonObject(), null, ct);
+            Write(ctx, pr.GetValue(json), new JsonObject { ["connectionId"] = id.ToString("D"), ["alreadyDisconnected"] = data?["alreadyDisconnected"]?.DeepClone() },
+                data?["alreadyDisconnected"]?.GetValue<bool>() == true ? "It was already disconnected." : "Disconnected; nothing more is sent to it.");
+        });
+
+        static (string Secret, string? ConnectionId) ReadMarketingSecret(string? envFile)
+        {
+            string? secret = null, connection = null;
+            if (envFile is not null)
+            {
+                if (!File.Exists(envFile)) throw new CliException(ExitCodes.Usage, "NO_FILE", $"{envFile} does not exist.");
+                foreach (var line in File.ReadAllLines(envFile))
+                {
+                    var i = line.IndexOf('=');
+                    if (i <= 0) continue;
+                    var (k, v) = (line[..i].Trim(), line[(i + 1)..].Trim());
+                    if (k == "INO_MA_SIGNING_SECRET") secret = v;
+                    if (k == "INO_MA_CONNECTION_ID") connection = v;
+                }
+            }
+            secret ??= Environment.GetEnvironmentVariable("INO_MA_SIGNING_SECRET");
+            if (string.IsNullOrEmpty(secret) || !secret.StartsWith("whsec_", StringComparison.Ordinal))
+                throw new CliException(ExitCodes.Usage, "NO_SECRET", "Give the signing secret: --env-file <the file from `ino marketing connect`> or INO_MA_SIGNING_SECRET=whsec_….");
+            return (secret, connection);
+        }
+
+        static string VerifyHint(string? error) => error switch
+        {
+            "PROOF_MISMATCH" => "Answer with proof = base64(HMAC-SHA256(key, challenge)), the key being your secret without \"whsec_\", base64-decoded.",
+            "CHALLENGE_MISMATCH" => "Answer the ping with the same challenge Ino sent.",
+            "EGRESS_BLOCKED" => "The address resolves to a private network; Ino calls public addresses only.",
+            "HTTP_401" or "HTTP_403" => "Your tool refused the request: check that it verifies the signature with the secret from `ino marketing connect`.",
+            "CHANGED_MEANWHILE" => "The connection changed while it was checked; run the command again.",
+            _ => "Check that your tool is reachable over https and answers the ping (see `ino docs marketing`).",
+        };
+
+        marketing.Subcommands.Add(mList);
+        marketing.Subcommands.Add(mConnect);
+        marketing.Subcommands.Add(mVerify);
+        marketing.Subcommands.Add(mDisconnect);
+        root.Subcommands.Add(marketing);
 
         // ---------------------------------------------------------------- hub (MCP/CLI P6a: connector store)
         var hub = new Command("hub", "Connector store: approved connectors, and sending yours to Tryino for review");
@@ -547,11 +1141,11 @@ public static class Commands
             var c = await HubTool.ReadCatalogAsync(ctx, ct);
             if (!c.Result.Ok) throw new CliException(ExitCodes.Business, "STORE_NOT_TRUSTED", $"The store catalog was refused: {c.Result.Status}. Nothing from it is shown.");
             var entries = HubTool.Listed(c.Result.Payload!).ToList();
-            var arr = new JsonArray(entries.Select(e => (JsonNode)new JsonObject { ["id"] = e.Id, ["name"] = e.Name, ["category"] = e.Category, ["vendor"] = e.Vendor,
+            var arr = new JsonArray(entries.Select(e => (JsonNode)new JsonObject { ["id"] = e.Id, ["name"] = e.Name, ["kind"] = e.Kind, ["category"] = e.Category, ["vendor"] = e.Vendor,
                 ["languages"] = new JsonArray(e.Languages.Select(l => (JsonNode)l).ToArray()), ["version"] = e.Version, ["approvedAt"] = e.ApprovedAt.ToString("yyyy-MM-dd") }).ToArray());
             var head = c.SignedByTryino ? $"Store catalog v{c.Result.Payload!.Version} (signed by Tryino)" : $"TEST catalog v{c.Result.Payload!.Version} (signed with an extra key, not by Tryino)";
             Write(ctx, pr.GetValue(json), new JsonObject { ["version"] = c.Result.Payload!.Version, ["signedByTryino"] = c.SignedByTryino, ["connectors"] = arr },
-                entries.Count == 0 ? head + "\nNo approved connectors yet." : head + "\n" + string.Join("\n", entries.Select(e => $"{e.Id,-28} {e.Name} · {e.Vendor} · {string.Join("/", e.Languages)} · approved {e.ApprovedAt:yyyy-MM-dd}")));
+                entries.Count == 0 ? head + "\nNo approved connectors yet." : head + "\n" + string.Join("\n", entries.Select(e => $"{e.Id,-28} {(e.Kind == "marketing" ? "[marketing] " : "")}{e.Name} · {e.Vendor} · {string.Join("/", e.Languages)} · approved {e.ApprovedAt:yyyy-MM-dd}")));
         });
         var hubId = new Argument<string>("id") { Description = "Connector id from `ino hub list`" };
         HubEntry Find(HubTool.Catalog c, string id) => !c.Result.Ok
@@ -565,7 +1159,8 @@ public static class Commands
             var node = JsonSerializer.SerializeToNode(e)!;
             Write(ctx, pr.GetValue(json), node, string.Join("\n",
                 $"{e.Name} ({e.Id}) {e.Version} · {e.Vendor}", e.Description, $"platform {e.Platform} · {e.Category} · languages {string.Join(", ", e.Languages)} · licence {e.License}",
-                $"compatibility: {e.Suite} suite, self-reported; approved by Tryino {e.ApprovedAt:yyyy-MM-dd}",
+                e.Kind == "marketing" ? $"marketing tool: connect it with `ino marketing connect`, check it with `ino connector test --kind marketing`; approved by Tryino {e.ApprovedAt:yyyy-MM-dd}"
+                    : $"compatibility: {e.Suite} suite, self-reported; approved by Tryino {e.ApprovedAt:yyyy-MM-dd}",
                 $"repository {e.Repository} · commit {e.Commit}{(e.Tag is null ? "" : $" ({e.Tag})")}", $"get it: ino hub get {e.Id}"));
         });
         var hubGet = new Command("get", "Print the commands that fetch the exact approved commit (runs nothing)") { hubId };
@@ -584,15 +1179,23 @@ public static class Commands
         var subNoCheck = new Option<bool>("--no-check") { Description = "Send without the compatibility result (the review takes longer)" };
         var subYes = new Option<bool>("--yes") { Description = "Send without asking (after reading the preview with --dry-run)" };
         var subDry = new Option<bool>("--dry-run") { Description = "Show exactly what would be sent, send nothing" };
+        var subReport = new Option<string?>("--marketing-report") { Description = "A marketing tool: the result of `ino connector test --kind marketing --json` saved to a file" };
         var hubSubmit = new Command("submit", "Send your connector to Tryino for review. Private: only Tryino sees it; nothing is published until Tryino approves")
-        { subDir, subCompany, subName, subEmail, subNote, subSuite, subNoCheck, subYes, subDry };
+        { subDir, subCompany, subName, subEmail, subNote, subSuite, subNoCheck, subYes, subDry, subReport };
         Bind(hubSubmit, async pr =>
         {
             var dir = Path.GetFullPath(pr.GetValue(subDir) ?? ctx.WorkingDir ?? Directory.GetCurrentDirectory());
             var manifest = HubTool.LoadManifest(dir);
             var git = HubTool.ReadGit(ctx, dir);
             JsonObject? check = null;
-            if (!pr.GetValue(subNoCheck))
+            if (!pr.GetValue(subNoCheck) && manifest.Kind == "marketing")
+            {
+                // P1c.2: a marketing tool is checked from the CLI against the tool (not by the engine): attach that report.
+                var file = pr.GetValue(subReport) ?? throw new CliException(ExitCodes.Usage, "NO_REPORT",
+                    "A marketing tool sends its contract test: `ino connector test --kind marketing --url … --json > report.json`, then --marketing-report report.json (or --no-check).");
+                check = HubTool.MarketingCheck(file);
+            }
+            else if (!pr.GetValue(subNoCheck))
             {
                 var resolved = ctx.Profiles.Resolve(pr.GetValue(profile));
                 Banner(ctx, resolved);
@@ -812,3 +1415,6 @@ public static class LiveGuard
             throw new CliException(ExitCodes.Usage, "NOT_CONFIRMED", "Not confirmed; nothing was sent.");
     }
 }
+
+/// <summary>Where a newly issued secret goes (`keys create` / `keys rotate`).</summary>
+sealed record SecretDestinations(string? Save, string? EnvFile, bool Show, string? Update);
