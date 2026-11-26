@@ -1,6 +1,6 @@
 ---
 name: ino-connector-author
-description: Build a self-hosted Ino Loyalty connector (an adapter that runs on the customer's or partner's server and links a shop, POS or other platform to the Ino channel API), from scaffold to a passing compatibility report. Use when someone wants to connect a platform Ino has no ready connector for.
+description: Build a self-hosted Ino Loyalty connector (an adapter that runs on the customer's or partner's server and links a shop, POS or other platform to the Ino channel API), from scaffold to a passing compatibility report. Use when someone wants to connect a platform Ino has no ready connector for, or connect their own marketing tool (e-mail, SMS, CDP) to Ino's Marketing Activation.
 ---
 
 # Writing a self-hosted Ino connector
@@ -39,3 +39,19 @@ A self-hosted connector is the customer's or partner's own code. It turns their 
 
 ## Done means
 `ino connector check` passes every scenario of its suite on the test channel, and `ino webhooks deliveries <id>` shows the receiver's deliveries as `SENT`.
+
+## Marketing tools (Marketing Activation)
+
+A marketing tool connector is the other direction: Ino sends loyalty profiles and events to the firm's own e-mail, SMS or CDP tool. Ino keeps consent, the erasure ledger, retries and pausing; the tool only applies what it gets and answers with the right status.
+
+1. **Scaffold:** `ino connector new <name> --kind marketing --lang node|python|csharp --platform "<tool>"`. Run the tests it prints. The only file to change is the tool file (`src/tool.js`, `connector/tool.py` or `src/Connector/Tool.cs`): replace each function with the tool's API and keep the return shapes. Leave the signature check and the contract as they are.
+2. **Secret:** `ino marketing connect --name "<tool>" --url https://<host>/ino --env-file ma.env` writes the connection id and signing secret to that file. Never show the secret in chat; the server reads it from `INO_MA_SIGNING_SECRET`.
+3. **Test locally:** run the server, then `ino connector test --kind marketing --url http://localhost:8080/ino --env-file ma.env`. All 13 checks must pass.
+4. **Go live:** deploy behind a public https address and run `ino marketing verify <connection id>`. Ino sends nothing before verify passes.
+5. **Store (optional):** `ino connector test --kind marketing --url … --env-file ma.env --json > report.json`, then `ino hub submit --marketing-report report.json`.
+
+Rules for marketing tools:
+- **Status codes mean something:** 404 means the profile is not there (Ino rebuilds it; on delete it counts as done). 401/403 stops the whole connection. 408/429/5xx are retried. Never redirect.
+- **Linking an existing profile:** when the member is matched to a profile the tool already had (same e-mail from a shop), answer `adopted: true` with `adoptedVia` set to the channel that matched, and return that address from `profile.subscription`.
+- **Events:** apply each `eventId` once.
+- **Data:** never log request bodies; delete everything on `profile.delete`.

@@ -524,7 +524,7 @@ public static class Commands
             var kind = pr.GetValue(kindOpt)!;
             var files = ConnectorScaffold.Create(dir, name, pr.GetValue(lang)!, pr.GetValue(platformOpt)!, channel, kind);
             Write(ctx, pr.GetValue(json), new JsonObject { ["dir"] = dir, ["kind"] = kind, ["files"] = new JsonArray(files.Select(f => (JsonNode)f).ToArray()) }, kind == "marketing"
-                ? $"Created {dir} ({files.Count} files): your marketing tool for Ino Loyalty.\nNext: cd {dir}, `ino marketing connect --name <name> --url https://<host>/ino --env-file ma.env` (or a test secret), copy INO_MA_SIGNING_SECRET into .env, {ConnectorScaffold.MarketingRunHint(pr.GetValue(lang)!)};\nthen `ino connector test --kind marketing --url http://localhost:8080/ino --env-file ma.env` and replace {(pr.GetValue(lang) == "python" ? "connector/tool.py" : "src/tool.js")} with your tool's API."
+                ? $"Created {dir} ({files.Count} files): your marketing tool for Ino Loyalty.\nNext: cd {dir}, `ino marketing connect --name <name> --url https://<host>/ino --env-file ma.env` (or a test secret), copy INO_MA_SIGNING_SECRET into .env, {ConnectorScaffold.MarketingRunHint(pr.GetValue(lang)!)};\nthen `ino connector test --kind marketing --url http://localhost:8080/ino --env-file ma.env` and replace {ConnectorScaffold.MarketingToolFile(pr.GetValue(lang)!)} with your tool's API."
                 : $"Created {dir} ({files.Count} files).\nNext: cd {dir} && cp .env.example .env (fill in the test key), {ConnectorScaffold.RunHint(pr.GetValue(lang)!)};\nthen run the scenarios and `ino connector check --suite ecommerce`.");
             return Task.CompletedTask;
         });
@@ -1082,7 +1082,47 @@ public static class Commands
             if (!ok)
                 throw new CliException(ExitCodes.Business, "NOT_VERIFIED", $"Your tool did not pass the check ({data?["error"]}); nothing is sent to it.",
                     VerifyHint(data?["error"]?.ToString()));
-            Write(ctx, pr.GetValue(json), output, $"Verified: the connection is {data?["status"]?.ToString().ToLowerInvariant()}. Ino now sends profiles, events, unsubscribes and deletions to it.");
+            if (data?["onPreviousSecret"]?.GetValue<bool>() == true) output["onPreviousSecret"] = true;
+            Write(ctx, pr.GetValue(json), output, data?["onPreviousSecret"]?.GetValue<bool>() == true
+                ? $"Your tool answered, but still with the previous signing secret: Ino keeps signing with both until the overlap ends. Put the new secret in the tool and run `ino marketing verify {id:D}` again."
+                : $"Verified: the connection is {data?["status"]?.ToString().ToLowerInvariant()}. Ino now sends profiles, events, unsubscribes and deletions to it.");
+        });
+        var mOverlap = new Option<int>("--overlap-hours") { Description = "How long the previous secret keeps signing next to the new one (0 = stop it now, for a leaked secret; at most 168)", DefaultValueFactory = _ => 24 };
+        var mRotEnv = new Option<string?>("--env-file") { Description = "Put the new INO_MA_SIGNING_SECRET in this file (created with mode 0600, or the line replaced in an existing file)" };
+        var mRotate = new Command("rotate-secret", "Renew the signing secret of your own tool. Nothing stops: Ino signs with both secrets until the tool is verified with the new one or the overlap ends")
+            { mId, mOverlap, mRotEnv, mShow };
+        Bind(mRotate, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var id = pr.GetValue(mId);
+            var envFile = pr.GetValue(mRotEnv);
+            var show = pr.GetValue(mShow);
+            var overlap = pr.GetValue(mOverlap);
+            if (overlap is < 0 or > 168) throw new CliException(ExitCodes.Usage, "BAD_OVERLAP", "--overlap-hours is between 0 and 168.");
+            if (envFile is null && !show)
+                throw new CliException(ExitCodes.Usage, "NO_SECRET_DESTINATION", "The new signing secret is shown only once. Choose where it goes: --env-file <path> or --show-secret.");
+            if (envFile is not null && Path.GetDirectoryName(Path.GetFullPath(envFile)) is { } dir && !Directory.Exists(dir))
+                throw new CliException(ExitCodes.Usage, "NO_FOLDER", $"The folder {dir} does not exist.");
+            // A new Idempotency-Key per run (Gate T M4): this run's own retries get the same secret; running it again renews again.
+            var data = await KeyWrite(name, InoLogin.TargetOf(prof.BaseUrl), $"marketing/connections/{id:D}/rotate-secret", new JsonObject { ["overlapHours"] = overlap },
+                "Ino did not confirm the renewal. Run `ino marketing list` and renew again if needed: the tool keeps working with the previous secret meanwhile.");
+            var secret = data?["secret"]?.GetValue<string>() ?? throw new CliException(ExitCodes.Business, "NO_SECRET", "Ino returned no signing secret.");
+            var kept = new List<string>();
+            if (envFile is not null)
+                try { ReplaceEnvValue(envFile, "INO_MA_SIGNING_SECRET", secret); kept.Add($"{envFile} (mode 0600)"); }
+                catch (Exception e)     // any failure: the renewal is done, so the secret must reach the person here (Gate K 6)
+                {
+                    ctx.Err.WriteLine($"warning: the secret could not be written to {envFile} ({e.Message}). Keep it now; it is not shown again:");
+                    ctx.Err.WriteLine($"INO_MA_SIGNING_SECRET={secret}");
+                }
+            var until = data?["previousValidUntil"]?.ToString();
+            var result = new JsonObject { ["connectionId"] = id.ToString("D"), ["previousValidUntil"] = until, ["savedTo"] = new JsonArray(kept.Select(x => (JsonNode)x).ToArray()) };
+            if (show) result["secret"] = secret;
+            Write(ctx, pr.GetValue(json), result, "Signing secret renewed." +
+                (string.IsNullOrEmpty(until) ? " The previous secret stopped now: your tool refuses Ino's calls until it has the new one." : $" The previous secret also signs until {until}.") +
+                (kept.Count > 0 ? " Saved to " + string.Join(" and ", kept) + "." : "") +
+                (show ? $"\nSigning secret: {secret}\nThis is the only time it is shown." : "") +
+                $"\nPut it in your tool, then run: ino marketing verify {id:D}");
         });
         var mYes = new Option<bool>("--yes") { Description = "Disconnect without asking" };
         var mDisconnect = new Command("disconnect", "Stop sending to a marketing connection (an own tool keeps its address and secret; `verify` reconnects it)") { mId, mYes };
@@ -1094,6 +1134,112 @@ public static class Commands
             var data = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Post, $"marketing/connections/{id:D}/disconnect", new JsonObject(), null, ct);
             Write(ctx, pr.GetValue(json), new JsonObject { ["connectionId"] = id.ToString("D"), ["alreadyDisconnected"] = data?["alreadyDisconnected"]?.DeepClone() },
                 data?["alreadyDisconnected"]?.GetValue<bool>() == true ? "It was already disconnected." : "Disconnected; nothing more is sent to it.");
+        });
+
+        /// <summary>
+        /// Sets KEY=value in an env file: every line that sets the key (also <c>export KEY=</c>) becomes the one new line, other lines kept; written to a
+        /// temporary file (0600) next to it and moved over it in one step (Gate K 5). Never through a symbolic link.
+        /// </summary>
+        static void ReplaceEnvValue(string envFile, string key, string value)
+        {
+            // A symlink is refused (Gate S note 3): a planted link must not make the CLI rewrite another file.
+            if (new FileInfo(envFile).LinkTarget is not null) throw new IOException($"{envFile} is a symbolic link; give the file itself");
+            var lines = File.Exists(envFile) ? File.ReadAllLines(envFile).ToList() : [];
+            static bool Sets(string line, string key)
+            {
+                var l = line.TrimStart();
+                if (l.StartsWith("export ", StringComparison.Ordinal)) l = l[7..].TrimStart();
+                return l.StartsWith(key + "=", StringComparison.Ordinal) || l.StartsWith(key + " =", StringComparison.Ordinal);
+            }
+            var at = lines.FindIndex(l => Sets(l, key));
+            lines.RemoveAll(l => Sets(l, key));
+            lines.Insert(at >= 0 ? at : lines.Count, $"{key}={value}");
+            var tmp = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(envFile))!, $".{Path.GetFileName(envFile)}.{Guid.NewGuid():N}.tmp");
+            var opts = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
+            if (!OperatingSystem.IsWindows()) opts.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+            try
+            {
+                using (var fs = new FileStream(tmp, opts))
+                {
+                    using (var f = new StreamWriter(fs, new System.Text.UTF8Encoding(false), leaveOpen: true)) f.Write(string.Join("\n", lines) + "\n");
+                    fs.Flush(flushToDisk: true);
+                }
+                File.Move(tmp, envFile, overwrite: true);
+            }
+            finally { if (File.Exists(tmp)) File.Delete(tmp); }
+        }
+
+        // MA5d1 (docs/MARKETING_ACTIVATION.md §33): actions a marketing tool reports back (e.g. a Klaviyo flow's webhook step) become `marketing.action` events.
+        var mActions = new Command("actions", "Actions a marketing tool may report back to Ino, today's counts, and where the tool calls") { mId };
+        Bind(mActions, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var id = pr.GetValue(mId);
+            var data = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Get, $"marketing/connections/{id:D}/actions", null, null, ct);
+            var rows = data?["actions"]?.AsArray() ?? [];
+            var token = data?["token"];
+            Write(ctx, pr.GetValue(json), data?.DeepClone() ?? new JsonObject(),
+                $"Endpoint: POST {data?["endpoint"]}  (Authorization: Bearer <action token>; body: profile_id, dedupe)\n" +
+                (token is null ? "No action token yet: run `ino marketing action-token " + id.ToString("D") + " --env-file <file>`.\n"
+                    : $"Action token since {token["createdAt"]}; caps {token["dailyCap"]}/day, {token["memberDailyCap"]}/member/day. Today: {data?["today"]?["accepted"]} accepted, {data?["today"]?["refused"]} refused.\n") +
+                (rows.Count == 0 ? "No actions yet: add one with `ino marketing action-set " + id.ToString("D") + " <key> --name \"…\" --on`."
+                    : string.Join("\n", rows.Select(a => $"{a?["key"],-24} {(a?["enabled"]?.GetValue<bool>() == true ? "on " : "off")} v{a?["version"]}  {a?["name"]}  " +
+                        $"caps {a?["memberDailyCap"]}/member {a?["connectionDailyCap"]}/day  today {a?["today"]?["accepted"]}✓ {a?["today"]?["refused"]}✗"))));
+        });
+        var aKey = new Argument<string>("key") { Description = "The action key, e.g. survey.completed (lower case, digits, . - _), or * for the connection's own caps" };
+        var aName = new Option<string?>("--name") { Description = "What the action means, shown in Power Apps and in the event" };
+        var aOn = new Option<bool>("--on") { Description = "Accept this action" };
+        var aOff = new Option<bool>("--off") { Description = "Refuse this action from now on" };
+        var aMember = new Option<int?>("--member-daily-cap") { Description = "At most this many per member per day (1-100)" };
+        var aDaily = new Option<int?>("--daily-cap") { Description = "At most this many per day for the whole connection" };
+        var aVersion = new Option<int?>("--version") { Description = "The version `ino marketing actions` shows (0 or leave out for a new action); a change made meanwhile is not overwritten" };
+        var mActionSet = new Command("action-set", "Add or change an action a marketing tool may report") { mId, aKey, aName, aOn, aOff, aMember, aDaily, aVersion };
+        Bind(mActionSet, async pr =>
+        {
+            if (pr.GetValue(aOn) && pr.GetValue(aOff)) throw new CliException(ExitCodes.Usage, "BAD_FLAGS", "Choose --on or --off, not both.");
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var id = pr.GetValue(mId);
+            var key = pr.GetValue(aKey)!;
+            var body = new JsonObject { ["name"] = pr.GetValue(aName), ["memberDailyCap"] = pr.GetValue(aMember), ["connectionDailyCap"] = pr.GetValue(aDaily), ["version"] = pr.GetValue(aVersion) ?? 0 };
+            if (pr.GetValue(aOn)) body["enabled"] = true;
+            if (pr.GetValue(aOff)) body["enabled"] = false;
+            var data = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Put,
+                $"marketing/connections/{id:D}/actions/{Uri.EscapeDataString(key)}", body, null, ct);
+            Write(ctx, pr.GetValue(json), data?.DeepClone() ?? new JsonObject(), data?["changed"]?.GetValue<bool>() == false
+                ? "Nothing changed: someone changed this action meanwhile. Run `ino marketing actions` and use the version it shows."
+                : key == "*" ? "Connection caps saved." : $"Saved {key} (version {data?["version"]}).");
+        });
+        var tEnvFile = new Option<string?>("--env-file") { Description = "Put INO_MA_ACTION_TOKEN in this file (created with mode 0600, or the line replaced)" };
+        var mActionToken = new Command("action-token", "A new action token for the connection (the previous one stops). Shown once: --env-file or --show-secret")
+            { mId, tEnvFile, mShow };
+        Bind(mActionToken, async pr =>
+        {
+            var envFile = pr.GetValue(tEnvFile);
+            var show = pr.GetValue(mShow);
+            if (envFile is null && !show)
+                throw new CliException(ExitCodes.Usage, "NO_SECRET_DESTINATION", "The action token is shown only once. Choose where it goes: --env-file <path> or --show-secret.");
+            if (envFile is not null && Path.GetDirectoryName(Path.GetFullPath(envFile)) is { } dir && !Directory.Exists(dir))
+                throw new CliException(ExitCodes.Usage, "NO_FOLDER", $"The folder {dir} does not exist.");
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var id = pr.GetValue(mId);
+            // A new Idempotency-Key per run: this run's retries get the same token; running it again makes a new one.
+            var data = await KeyWrite(name, InoLogin.TargetOf(prof.BaseUrl), $"marketing/connections/{id:D}/action-token", new JsonObject(),
+                "Ino did not confirm the new token. Run the command again: it makes a new one and the earlier one stops.");
+            var token = data?["token"]?.GetValue<string>() ?? throw new CliException(ExitCodes.Business, "NO_TOKEN", "Ino returned no token.");
+            var kept = new List<string>();
+            if (envFile is not null)
+                try { ReplaceEnvValue(envFile, "INO_MA_ACTION_TOKEN", token); kept.Add($"{envFile} (mode 0600)"); }
+                catch (Exception e)
+                {
+                    ctx.Err.WriteLine($"warning: the token could not be written to {envFile} ({e.Message}). Keep it now; it is not shown again:");
+                    ctx.Err.WriteLine($"INO_MA_ACTION_TOKEN={token}");
+                }
+            var result = new JsonObject { ["connectionId"] = id.ToString("D"), ["tokenId"] = data?["tokenId"]?.DeepClone(), ["savedTo"] = new JsonArray(kept.Select(x => (JsonNode)x).ToArray()) };
+            if (show) result["token"] = token;
+            Write(ctx, pr.GetValue(json), result, "New action token; the previous one stopped." +
+                (kept.Count > 0 ? " Saved to " + string.Join(" and ", kept) + "." : "") +
+                (show ? $"\nAction token: {token}\nThis is the only time it is shown." : "") +
+                $"\nYour tool calls POST …/ma/actions/{id:D}/<key> with Authorization: Bearer <token>; see `ino marketing actions {id:D}`.");
         });
 
         static (string Secret, string? ConnectionId) ReadMarketingSecret(string? envFile)
@@ -1130,6 +1276,10 @@ public static class Commands
         marketing.Subcommands.Add(mList);
         marketing.Subcommands.Add(mConnect);
         marketing.Subcommands.Add(mVerify);
+        marketing.Subcommands.Add(mRotate);
+        marketing.Subcommands.Add(mActions);
+        marketing.Subcommands.Add(mActionSet);
+        marketing.Subcommands.Add(mActionToken);
         marketing.Subcommands.Add(mDisconnect);
         root.Subcommands.Add(marketing);
 

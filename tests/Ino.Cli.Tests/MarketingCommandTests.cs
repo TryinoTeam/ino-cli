@@ -10,6 +10,8 @@ public class MarketingCommandTests
 
     const string Secret = "whsec_c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0LTAx";
     const string Id = "8b0e1d0c-0000-4000-8000-000000000001";
+    const string ActionToken = "ino_mat_c2VjcmV0LWFjdGlvbi10b2tlbi1zZWNyZXQtYWN0aW9u";
+    const string NewSecret = "whsec_bmV3LXNlY3JldC1uZXctc2VjcmV0LW5ldy1zZWNyZXQtMDI=";
 
     sealed class Fake
     {
@@ -24,6 +26,11 @@ public class MarketingCommandTests
             switch (path)
             {
                 case "/oauth/token": return RouteHandler.Json($$"""{"access_token":"{{token}}","refresh_token":"rt-1"}""");
+                case "/t/tabc1234/manage/v1/marketing/connections/8b0e1d0c-0000-4000-8000-000000000001/actions" when req.Method == HttpMethod.Get:
+                    return RouteHandler.Json("""{"data":{"connectionId":"8b0e1d0c-0000-4000-8000-000000000001","status":"CONNECTED","token":{"createdAt":"2026-11-26T10:00:00Z","dailyCap":5000,"memberDailyCap":20},"endpoint":"https://api.example.test/t/tabc1234/ma/actions/8b0e1d0c-0000-4000-8000-000000000001/{action}","today":{"accepted":3,"refused":1},"actions":[{"key":"survey.completed","name":"Survey completed","enabled":true,"memberDailyCap":1,"connectionDailyCap":1000,"version":2,"today":{"accepted":3,"refused":1}}]}}""");
+                case "/t/tabc1234/manage/v1/marketing/connections/8b0e1d0c-0000-4000-8000-000000000001/actions/survey.completed" when req.Method == HttpMethod.Put:
+                    Posts.Add((path, null, Encoding.UTF8.GetString(body)));
+                    return RouteHandler.Json("""{"data":{"connectionId":"8b0e1d0c-0000-4000-8000-000000000001","changed":true,"item":"survey.completed","version":3,"enabled":false}}""");
                 case "/t/tabc1234/manage/v1/marketing/connections" when req.Method == HttpMethod.Get:
                     return RouteHandler.Json("""{"data":{"connections":[{"id":"8b0e1d0c-0000-4000-8000-000000000001","type":"CUSTOM","status":"PENDING_CONFIRM","name":"Our mailer","account":"mailer.example.com"}]}}""");
             }
@@ -32,6 +39,10 @@ public class MarketingCommandTests
             if (path.EndsWith("/verify", StringComparison.Ordinal)) return RouteHandler.Json(VerifyAnswer);
             if (path.EndsWith("/disconnect", StringComparison.Ordinal)) return RouteHandler.Json("""{"data":{"connectionId":"8b0e1d0c-0000-4000-8000-000000000001","alreadyDisconnected":false}}""");
             if (Posts.Count <= FailFirstConnects) throw new HttpRequestException("connection reset");
+            if (path.EndsWith("/action-token", StringComparison.Ordinal))
+                return RouteHandler.Json($$$"""{"data":{"connectionId":"{{{Id}}}","token":"{{{ActionToken}}}","tokenId":"5d1e0000-0000-4000-8000-000000000009","renewed":true}}""");
+            if (path.EndsWith("/rotate-secret", StringComparison.Ordinal))
+                return RouteHandler.Json($$$"""{"data":{"connectionId":"{{{Id}}}","secret":"{{{NewSecret}}}","version":2,"previousValidUntil":"2026-11-27T10:00:00+00:00","status":"CONNECTED"}}""");
             return RouteHandler.Json($$$"""{"data":{"connectionId":"{{{Id}}}","name":"Our mailer","host":"mailer.example.com","secret":"{{{Secret}}}","status":"PENDING_CONFIRM"}}""");
         });
         public Func<Uri, Task> Browser => async url =>
@@ -104,5 +115,81 @@ public class MarketingCommandTests
         var (_, list, _) = await h.Run("--profile", "dev", "marketing", "list");
         Assert.Contains("CUSTOM", list);
         Assert.Contains("mailer.example.com", list);
+    }
+
+    [Fact]
+    public async Task Rotate_secret_replaces_only_the_secret_line_uses_a_new_key_per_run_and_never_prints_it_unasked()
+    {
+        var (h, f) = await SignedIn();
+        using var hh = h;
+        var env = Path.Combine(h.Dir, "ma.env");
+        await File.WriteAllTextAsync(env, $"INO_MA_CONNECTION_ID={Id}\nINO_MA_SIGNING_SECRET={Secret}\nPORT=8080\nexport INO_MA_SIGNING_SECRET={Secret}\n");
+        Assert.Equal(ExitCodes.Usage, (await h.Run("--profile", "dev", "marketing", "rotate-secret", Id)).Code);          // no place for the secret
+        Assert.Equal(ExitCodes.Usage, (await h.Run("--profile", "dev", "marketing", "rotate-secret", Id, "--env-file", env, "--overlap-hours", "200")).Code);
+        Assert.Empty(f.Posts);
+        f.FailFirstConnects = 1;      // the first attempt is lost: the retry carries the same Idempotency-Key
+        var (code, output, err) = await h.Run("--profile", "dev", "marketing", "rotate-secret", Id, "--env-file", env);
+        Assert.True(code == ExitCodes.Ok, err);
+        Assert.Equal(2, f.Posts.Count);
+        Assert.Equal(f.Posts[0].Key, f.Posts[1].Key);
+        Assert.Contains("\"overlapHours\":24", f.Posts[1].Body);
+        Assert.Equal([$"INO_MA_CONNECTION_ID={Id}", $"INO_MA_SIGNING_SECRET={NewSecret}", "PORT=8080"], await File.ReadAllLinesAsync(env));
+        if (!OperatingSystem.IsWindows()) Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(env));
+        Assert.DoesNotContain(NewSecret, output + err);
+        Assert.Contains("ino marketing verify", output);
+        Assert.Empty(Directory.GetFiles(h.Dir, ".ma.env.*.tmp"));
+        // Running it again is a new renewal: a new key.
+        Assert.Equal(ExitCodes.Ok, (await h.Run("--profile", "dev", "marketing", "rotate-secret", Id, "--show-secret", "--overlap-hours", "0")).Code);
+        Assert.NotEqual(f.Posts[1].Key, f.Posts[2].Key);
+        Assert.Contains("\"overlapHours\":0", f.Posts[2].Body);
+        // A symlinked env file is never written through; the secret goes to stderr instead.
+        if (!OperatingSystem.IsWindows())
+        {
+            var target = Path.Combine(h.Dir, "other.txt");
+            await File.WriteAllTextAsync(target, "keep me\n");
+            var link = Path.Combine(h.Dir, "link.env");
+            File.CreateSymbolicLink(link, target);
+            var (c2, _, err2) = await h.Run("--profile", "dev", "marketing", "rotate-secret", Id, "--env-file", link);
+            Assert.Equal(ExitCodes.Ok, c2);
+            Assert.Equal("keep me\n", await File.ReadAllTextAsync(target));
+            Assert.Contains("symbolic link", err2);
+            Assert.Contains($"INO_MA_SIGNING_SECRET={NewSecret}", err2);
+        }
+    }
+
+    [Fact]
+    public async Task Verify_says_when_the_tool_still_answers_with_the_previous_secret()
+    {
+        var (h, f) = await SignedIn();
+        using var hh = h;
+        f.VerifyAnswer = """{"data":{"connectionId":"8b0e1d0c-0000-4000-8000-000000000001","connected":true,"status":"CONNECTED","error":null,"capabilities":[],"onPreviousSecret":true}}""";
+        var (code, output, _) = await h.Run("--profile", "dev", "marketing", "verify", Id);
+        Assert.Equal(ExitCodes.Ok, code);
+        Assert.Contains("previous signing secret", output);
+    }
+
+    [Fact]
+    public async Task Actions_list_set_and_a_token_that_goes_only_where_asked()
+    {
+        var (h, f) = await SignedIn();
+        using var hh = h;
+        var (code, output, _) = await h.Run("--profile", "dev", "marketing", "actions", Id);
+        Assert.Equal(ExitCodes.Ok, code);
+        Assert.Contains("survey.completed", output);
+        Assert.Contains("POST https://api.example.test/t/tabc1234/ma/actions/", output);
+        Assert.Equal(ExitCodes.Usage, (await h.Run("--profile", "dev", "marketing", "action-set", Id, "survey.completed", "--on", "--off")).Code);
+        (code, output, _) = await h.Run("--profile", "dev", "marketing", "action-set", Id, "survey.completed", "--off", "--version", "2");
+        Assert.Equal(ExitCodes.Ok, code);
+        Assert.Contains("version 3", output);
+        Assert.Contains("\"enabled\":false", f.Posts.Last().Body);
+        Assert.Contains("\"version\":2", f.Posts.Last().Body);
+        // The token is shown once and only where asked.
+        Assert.Equal(ExitCodes.Usage, (await h.Run("--profile", "dev", "marketing", "action-token", Id)).Code);
+        var env = Path.Combine(h.Dir, "actions.env");
+        var (c2, out2, err2) = await h.Run("--profile", "dev", "marketing", "action-token", Id, "--env-file", env);
+        Assert.Equal(ExitCodes.Ok, c2);
+        Assert.Equal([$"INO_MA_ACTION_TOKEN={ActionToken}"], await File.ReadAllLinesAsync(env));
+        Assert.DoesNotContain(ActionToken, out2 + err2);
+        Assert.NotNull(f.Posts.Last().Key);
     }
 }

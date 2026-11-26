@@ -212,10 +212,11 @@ filter were pinned to the types that existed then, so new types never reach an i
 | `voucher.expired` (v1) | Vouchers | **Voucher expired.** An unused voucher reached its expiry date. Remove any copy you keep, such as a store coupon. |
 | `member.registered` (v1) | Members | **Member joined.** A new member joined the loyalty program (through a channel, in the app or by an import). The event carries ids only; read the profile with customer.get360 if you need it. |
 | `member.updated` (v1) | Members | **Member profile updated.** A member's profile changed — through the API, in the Ino Loyalty app, in another Dynamics app or by an import. Sent within about two minutes; only the names of the changed fields are sent, not their values. |
-| `consent.changed` (v1) | Members | **Contact permission changed.** A member gave or withdrew a contact permission (email, SMS, call or data sharing). Respect it in your own systems right away. |
+| `consent.changed` (v1) | Members | **Contact permission changed.** A member gave or withdrew a contact permission (email, SMS, call or data sharing). Respect it in your own systems right away. The channel says where: POS, ECOM, MOBILE, CALL_CENTER, IYS_PORTAL, or MARKETING_TOOL when the member unsubscribed in a connected marketing tool. |
 | `referral.joined` (v1) | Referral | **Friend joined with an invite.** Someone became a member with another member's referral code. Use it to thank the inviting member. No reward yet: rewards follow the friend's first order. |
 | `referral.rewarded` (v1) | Referral | **Referral reward given.** The friend's first order passed the return period and the rewards were given. Use it to tell the members about their reward. |
 | `referral.milestone_reached` (v1) | Referral | **Referral milestone reached.** A member's rewarded invites reached a milestone of the program and the bonus was given. Use it to congratulate the member. |
+| `marketing.action` (v1) | Marketing | **Marketing tool action.** A connected marketing tool (for example a Klaviyo flow) reported an action of the member, such as a completed survey. Ino records it; it gives no points by itself. Never sent back to the marketing tools. |
 | `game.completed` (v1) | Games | **Game completed.** A member finished a game and the server verified the score, or completed a garden or a mission. Fires once per play (once per garden or mission). |
 | `game.reward_given` (v1) | Games | **Game reward given.** A game rule gave the member points, a voucher or a badge. |
 | `game.reward_reversed` (v1) | Games | **Game reward reversed.** A game reward was taken back: staff voided the play, or a return took the member below the reward's score. |
@@ -229,7 +230,6 @@ filter were pinned to the types that existed then, so new types never reach an i
 | `campaign.changed` (v1) | Segments & campaigns | **Campaign changed.** A campaign was created or changed (dates, status, rules). Use it to refresh campaign data cached in tills and apps. |
 | `job.completed` (v1) | Bulk jobs | **Bulk job completed.** A bulk job you submitted (file import, point load, segment export) finished. Row counts tell how many rows succeeded or failed. |
 | `job.failed` (v1) | Bulk jobs | **Bulk job failed.** A bulk job you submitted could not be processed. |
-<!-- event-catalog:end -->
 
 Notes:
 - `member.registered` and `voucher.redeemed` are sent immediately when the member/voucher is saved through Ino Loyalty. A

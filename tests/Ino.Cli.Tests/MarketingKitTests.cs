@@ -38,7 +38,14 @@ public class MarketingKitTests
         // No secret value anywhere (the template only reads it from the environment; its own test makes a random one at run time).
         Assert.DoesNotContain(Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories), f => System.Text.RegularExpressions.Regex.IsMatch(File.ReadAllText(f), "whsec_[A-Za-z0-9+/]{20,}"));
         Assert.Contains("ino connector test --kind marketing", output);
-        Assert.Equal(ExitCodes.Usage, (await h.Run("connector", "new", "acme-mailer2", "--kind", "marketing", "--lang", "csharp", "--dir", Path.Combine(h.Dir, "cs"))).Code);
+        Assert.Equal(ExitCodes.Usage, (await h.Run("connector", "new", "acme-mailer2", "--kind", "marketing", "--lang", "ruby", "--dir", Path.Combine(h.Dir, "rb"))).Code);
+        var cs = Path.Combine(h.Dir, "cs");
+        var csRun = await h.Run("connector", "new", "acme-mailer4", "--kind", "marketing", "--lang", "csharp", "--dir", cs);
+        Assert.Equal(ExitCodes.Ok, csRun.Code);
+        Assert.Contains("replace src/Connector/Tool.cs", csRun.Out);
+        foreach (var f in new[] { "src/Connector/Program.cs", "src/Connector/Contract.cs", "src/Connector/Signature.cs", "src/Connector/Tool.cs", "src/Connector/Connector.csproj", "tests/Connector.Tests/ContractTests.cs", ".gitignore" })
+            Assert.True(File.Exists(Path.Combine(cs, f)), f);
+        Assert.Contains("<AssemblyName>acme-mailer4</AssemblyName>", await File.ReadAllTextAsync(Path.Combine(cs, "src/Connector/Connector.csproj")));
         var py = Path.Combine(h.Dir, "py");
         Assert.Equal(ExitCodes.Ok, (await h.Run("connector", "new", "acme-mailer3", "--kind", "marketing", "--lang", "python", "--dir", py)).Code);
         foreach (var f in new[] { "connector/server.py", "connector/contract.py", "connector/signature.py", "connector/tool.py", "tests/test_contract.py", ".gitignore" })
@@ -105,6 +112,7 @@ public class MarketingKitTests
     [Theory]
     [InlineData("node", "node", "src/server.js")]
     [InlineData("python", "python3", "-m connector.server")]
+    [InlineData("csharp", "dotnet", "run --project src/Connector")]
     public async Task The_generated_tool_passes_every_check_when_its_runtime_is_installed(string lang, string runtime, string args)
     {
         if (!Available(runtime)) return;      // the template's own tests cover it where the runtime exists
@@ -124,7 +132,7 @@ public class MarketingKitTests
             Assert.True(code == ExitCodes.Ok, output + err);
             Assert.Contains("All 13 checks passed.", output);
         }
-        finally { server.Kill(); }
+        finally { server.Kill(entireProcessTree: true); }   // dotnet run starts the tool as a child process
     }
 
     static bool Available(string runtime)
@@ -145,7 +153,7 @@ public class MarketingKitTests
     static async Task WaitForAsync(int port)
     {
         using var c = new HttpClient();
-        for (var i = 0; i < 50; i++)
+        for (var i = 0; i < 1200; i++)   // dotnet run builds first
         {
             try { if ((await c.GetAsync($"http://127.0.0.1:{port}/health")).IsSuccessStatusCode) return; } catch (HttpRequestException) { }
             await Task.Delay(100);

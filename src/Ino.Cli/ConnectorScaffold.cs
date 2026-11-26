@@ -10,12 +10,18 @@ public static partial class ConnectorScaffold
 {
     public static readonly string[] Languages = ["node", "python", "csharp"];
     /// <summary>MCP/CLI P1c.2: a marketing tool (receives Ino's signed activation contract); Node only for now.</summary>
-    public static readonly string[] MarketingLanguages = ["node", "python"];
+    public static readonly string[] MarketingLanguages = ["node", "python", "csharp"];
 
     /// <summary>How to test and start a generated marketing tool.</summary>
-    public static string MarketingRunHint(string lang) => lang == "python"
-        ? "python -m unittest discover -s tests, then python -m connector.server"
-        : "npm test, then npm start";
+    public static string MarketingRunHint(string lang) => lang switch
+    {
+        "python" => "python -m unittest discover -s tests, then python -m connector.server",
+        "csharp" => "dotnet test tests/Connector.Tests, then dotnet run --project src/Connector",
+        _ => "npm test, then npm start",
+    };
+
+    /// <summary>The one file a marketing tool author replaces with calls to their tool's API.</summary>
+    public static string MarketingToolFile(string lang) => lang switch { "python" => "connector/tool.py", "csharp" => "src/Connector/Tool.cs", _ => "src/tool.js" };
 
     /// <summary>The bundled template folder for a kind and language (sales: templates/&lt;lang&gt;, marketing: templates/marketing-&lt;lang&gt;).</summary>
     public static string TemplateKey(string kind, string lang) => kind == "marketing" ? "marketing-" + lang : lang;
@@ -47,7 +53,7 @@ public static partial class ConnectorScaffold
     {
         if (kind is not ("sales" or "marketing")) throw new CliException(ExitCodes.Usage, "BAD_KIND", "Kinds: sales, marketing.");
         if (kind == "marketing" && !MarketingLanguages.Contains(lang))
-            throw new CliException(ExitCodes.Usage, "BAD_LANG", $"The marketing tool template is available in: {string.Join(", ", MarketingLanguages)} (C# follows).");
+            throw new CliException(ExitCodes.Usage, "BAD_LANG", $"The marketing tool template is available in: {string.Join(", ", MarketingLanguages)}.");
         if (!Name().IsMatch(name)) throw new CliException(ExitCodes.Usage, "BAD_NAME", "Use a name like my-shop-connector (lower case, digits, -).");
         if (!Channel().IsMatch(channel)) throw new CliException(ExitCodes.Usage, "BAD_CHANNEL", "The channel code is not valid.");
         if (!Languages.Contains(lang)) throw new CliException(ExitCodes.Usage, "BAD_LANG", $"Languages: {string.Join(", ", Languages)}.");
