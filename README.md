@@ -39,7 +39,7 @@ Add `--json` to any command for machine-readable output; exit codes are stable (
 
 - Keys live in the keychain; `ino` never prints them.
 - Live is decided by the engine (`whoami`), not only by the profile name.
-- The connector store catalog is accepted only with Tryino's signature (ECDSA P-256); `ino hub get` prints commands, it never runs downloaded code.
+- The connector store catalog is accepted only with Tryino's signature (ECDSA P-256); `ino hub get` prints commands for a connector you run yourself and never runs downloaded code. For a definition package it downloads the one file the signed catalog names and writes it only if its size, SHA-256, id, version and kind match (`--as-own local_<name>` makes it your own package).
 - Report a vulnerability privately: Security → Report a vulnerability on this repository.
 
 ## Licence

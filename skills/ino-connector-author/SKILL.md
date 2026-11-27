@@ -11,6 +11,9 @@ A definition package is one `connector.json` the Ino engine runs. Consent, delet
 trail stay in the engine; the file only says how the platform's calls and events map to Ino. Use it whenever the platform has an HTTP API (or, for a
 POS, a sales file), which is most of the time.
 
+0. **Already in the Hub?** `ino hub list` marks approved definition packages `[definition: …]`. `ino hub get <id> --as-own local_<name>`
+   downloads the approved file, checks it against Tryino's signed catalog and writes it as the firm's own package (then continue at step 2).
+   The copy is the firm's own: Tryino's approval and later Hub versions do not follow it.
 1. **Skeleton:** `ino connector definition new <folder> --id local_<name> --kind marketing|ecommerce|pos`. It passes the engine's rules as it is.
    Read the `RULES.md` it writes before changing anything: it lists what a package of that kind may do.
    - `marketing`: Ino sends profiles, events, unsubscribes and deletions to the tool (Marketing Activation).

@@ -1519,10 +1519,11 @@ public static class Commands
             if (!c.Result.Ok) throw new CliException(ExitCodes.Business, "STORE_NOT_TRUSTED", $"The store catalog was refused: {c.Result.Status}. Nothing from it is shown.");
             var entries = HubTool.Listed(c.Result.Payload!).ToList();
             var arr = new JsonArray(entries.Select(e => (JsonNode)new JsonObject { ["id"] = e.Id, ["name"] = e.Name, ["kind"] = e.Kind, ["category"] = e.Category, ["vendor"] = e.Vendor,
-                ["languages"] = new JsonArray(e.Languages.Select(l => (JsonNode)l).ToArray()), ["version"] = e.Version, ["approvedAt"] = e.ApprovedAt.ToString("yyyy-MM-dd") }).ToArray());
+                ["languages"] = new JsonArray(e.Languages.Select(l => (JsonNode)l).ToArray()), ["version"] = e.Version, ["approvedAt"] = e.ApprovedAt.ToString("yyyy-MM-dd"),
+                ["runtime"] = e.Runtime, ["shape"] = e.Definition?.Shape }).ToArray());
             var head = c.SignedByTryino ? $"Store catalog v{c.Result.Payload!.Version} (signed by Tryino)" : $"TEST catalog v{c.Result.Payload!.Version} (signed with an extra key, not by Tryino)";
             Write(ctx, pr.GetValue(json), new JsonObject { ["version"] = c.Result.Payload!.Version, ["signedByTryino"] = c.SignedByTryino, ["connectors"] = arr },
-                entries.Count == 0 ? head + "\nNo approved connectors yet." : head + "\n" + string.Join("\n", entries.Select(e => $"{e.Id,-28} {(e.Kind == "marketing" ? "[marketing] " : "")}{e.Name} · {e.Vendor} · {string.Join("/", e.Languages)} · approved {e.ApprovedAt:yyyy-MM-dd}")));
+                entries.Count == 0 ? head + "\nNo approved connectors yet." : head + "\n" + string.Join("\n", entries.Select(e => $"{e.Id,-28} {(e.Definition is { } df ? $"[definition: {df.Shape}] " : e.Kind == "marketing" ? "[marketing] " : "")}{e.Name} · {e.Vendor} · {string.Join("/", e.Languages)} · approved {e.ApprovedAt:yyyy-MM-dd}")));
         });
         var hubId = new Argument<string>("id") { Description = "Connector id from `ino hub list`" };
         HubEntry Find(HubTool.Catalog c, string id) => !c.Result.Ok
@@ -1536,16 +1537,43 @@ public static class Commands
             var node = JsonSerializer.SerializeToNode(e)!;
             Write(ctx, pr.GetValue(json), node, string.Join("\n",
                 $"{e.Name} ({e.Id}) {e.Version} · {e.Vendor}", e.Description, $"platform {e.Platform} · {e.Category} · languages {string.Join(", ", e.Languages)} · licence {e.License}",
-                e.Kind == "marketing" ? $"marketing tool: connect it with `ino marketing connect`, check it with `ino connector test --kind marketing`; approved by Tryino {e.ApprovedAt:yyyy-MM-dd}"
+                e.Definition is { } dd ? $"definition package ({dd.Shape}, runs in Ino): {dd.Path} · {dd.Bytes} bytes · SHA-256 {dd.Sha256[..16]}…{(dd.Requires.Count > 0 ? " · requires " + string.Join(", ", dd.Requires) : "")}; approved by Tryino {e.ApprovedAt:yyyy-MM-dd}"
+                : e.Kind == "marketing" ? $"marketing tool: connect it with `ino marketing connect`, check it with `ino connector test --kind marketing`; approved by Tryino {e.ApprovedAt:yyyy-MM-dd}"
                     : $"compatibility: {e.Suite} suite, self-reported; approved by Tryino {e.ApprovedAt:yyyy-MM-dd}",
-                $"repository {e.Repository} · commit {e.Commit}{(e.Tag is null ? "" : $" ({e.Tag})")}", $"get it: ino hub get {e.Id}"));
+                $"repository {e.Repository} · commit {e.Commit}{(e.Tag is null ? "" : $" ({e.Tag})")}",
+                e.Definition is null ? $"get it: ino hub get {e.Id}" : $"get it: ino hub get {e.Id} --as-own local_<name>"));
         });
-        var hubGet = new Command("get", "Print the commands that fetch the exact approved commit (runs nothing)") { hubId };
+        var getOut = new Option<string?>("--out") { Description = "A definition package: the file to write (default <id>.connector.json; never overwritten)" };
+        var getAsOwn = new Option<string?>("--as-own") { Description = "A definition package: write it as your own package with this id (local_<name>) so you can save it" };
+        var hubGet = new Command("get", "A connector you run yourself: print the commands that fetch the approved commit (runs nothing). A definition package: download the approved file and check it")
+            { hubId, getOut, getAsOwn };
         Bind(hubGet, async pr =>
         {
             var c = await HubTool.ReadCatalogAsync(ctx, ct);
             var e = Find(c, pr.GetValue(hubId)!);
-            Write(ctx, pr.GetValue(json), new JsonObject { ["id"] = e.Id, ["mirror"] = e.Mirror, ["commit"] = e.Commit, ["commands"] = HubTool.GetCommands(e) }, HubTool.GetCommands(e));
+            if (e.Runtime != "definition")
+            {
+                if (pr.GetValue(getOut) is not null || pr.GetValue(getAsOwn) is not null)
+                    throw new CliException(ExitCodes.Usage, "NOT_A_DEFINITION", $"{e.Id} is a connector you run yourself: --out and --as-own are for definition packages.");
+                Write(ctx, pr.GetValue(json), new JsonObject { ["id"] = e.Id, ["runtime"] = e.Runtime, ["mirror"] = e.Mirror, ["commit"] = e.Commit, ["commands"] = HubTool.GetCommands(e) },
+                    HubTool.GetCommands(e));
+                return;
+            }
+            // IL9b: the file the signed catalog names, checked before anything is written.
+            var got = await HubTool.GetDefinitionAsync(ctx, e, pr.GetValue(getOut), pr.GetValue(getAsOwn), ct);
+            var test = c.SignedByTryino ? "" : "TEST catalog, not signed by Tryino. ";
+            var next = got.AsOwn
+                ? $"It is your own package now ({got.Id}): Tryino's approval and later versions of {e.Id} do not follow it. If {got.Id} is already one of your packages, choose another id. Next:\n  ino connector package check {got.File}\n  ino connector package save {got.File}"
+                : $"To save it in your environment it needs your own id: run again with --as-own local_<name> (or change \"id\" in the file).";
+            var where = got.Shape switch
+            {
+                "marketing" => "Then connect it: ino marketing connect --definition <id> --version <v> … (or Power Apps → Marketing Activation → Your own package).",
+                "posFile" => "Then pin it to a channel: Power Apps → Integrations → Channels → the channel → POS file format.",
+                _ => "Then: ino connector package preview <id> <v> --set … and install (test tenants).",
+            };
+            Write(ctx, pr.GetValue(json), new JsonObject { ["id"] = e.Id, ["runtime"] = e.Runtime, ["file"] = got.File, ["savedAs"] = got.Id, ["version"] = got.Version, ["shape"] = got.Shape,
+                ["bytes"] = got.Bytes, ["sha256"] = e.Definition!.Sha256, ["asOwn"] = got.AsOwn, ["signedByTryino"] = c.SignedByTryino },
+                $"{test}Wrote {got.File} ({e.Id} {got.Version}, SHA-256 checked against the catalog).\n{next}\n{where}");
         });
         var subDir = new Option<string?>("--dir") { Description = "Connector project folder (default: current folder)" };
         var subCompany = new Option<string>("--company") { Description = "Your company", Required = true };

@@ -209,6 +209,114 @@ public static partial class HubTool
     /// <summary>Approved connectors: sales connectors and (P1c.2) marketing tools; anything else a future catalog adds is left out.</summary>
     public static IEnumerable<HubEntry> Listed(HubCatalogPayload p) => p.Entries.Where(e => e.Kind is "sales" or "marketing");
 
+    // ---------- definition packages (IL9b, docs/INTEGRATION_LAYER.md §14.2-14.3) ----------
+
+    /// <summary>The file's raw address, derived only from the entry's github.com mirror, its approved commit and its path (T36).</summary>
+    public static Uri RawUrl(HubEntry e)
+    {
+        // From the mirror string itself (review IL9b-1 2): no Uri normalisation of dot segments.
+        var m = HubEnvelope.GitHubRepoRe().Match(e.Mirror);
+        if (!m.Success) throw new CliException(ExitCodes.Business, "STORE_NOT_TRUSTED", $"{e.Id}'s mirror is not a github.com repository.");
+        return new Uri($"https://raw.githubusercontent.com/{m.Groups["owner"].Value}/{m.Groups["repo"].Value}/{e.Commit}/{e.Definition!.Path}");
+    }
+
+    public sealed record DownloadedDefinition(string File, string Id, string Version, string Shape, int Bytes, bool AsOwn);
+
+    /// <summary>
+    /// Downloads the definition the signed catalog names and writes it only when every check passes (T35, T37): status 200 without a redirect, at most
+    /// the catalog's size, the catalog's SHA-256, the same reading as saving (no BOM, strict UTF-8, no duplicate keys), and the file's own id, version,
+    /// category, shape and requires equal to the catalog's. <paramref name="asOwn"/>: only the top-level "id" string's bytes are replaced (v2 M2).
+    /// The file is created new (never over an existing file or a link) and is not left half written.
+    /// </summary>
+    public static async Task<DownloadedDefinition> GetDefinitionAsync(CliContext ctx, HubEntry e, string? outPath, string? asOwn, CancellationToken ct)
+    {
+        var d = e.Definition ?? throw new CliException(ExitCodes.Usage, "NOT_A_DEFINITION", $"{e.Id} is not a definition package.");
+        if (asOwn is not null && (!ConnectorIds.IsPackage(asOwn) || ConnectorIds.Publisher(asOwn) != ConnectorIds.LocalPublisher))
+            throw new CliException(ExitCodes.Usage, "BAD_ID", "--as-own takes your own package id: local_, then 2-39 lower-case letters, digits and single hyphens.");
+        var file = Path.GetFullPath(outPath ?? Path.Combine(ctx.WorkingDir ?? Directory.GetCurrentDirectory(), (asOwn ?? e.Id) + ".connector.json"));
+
+        var uri = RawUrl(e);
+        byte[] body;
+        using (var http = new HttpClient(ctx.HubHandler ?? new SocketsHttpHandler { AllowAutoRedirect = false, AutomaticDecompression = System.Net.DecompressionMethods.None },
+            disposeHandler: ctx.HubHandler is null) { Timeout = Timeout.InfiniteTimeSpan })
+        using (var cts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+        {
+            cts.CancelAfter(TimeSpan.FromSeconds(30));   // the whole download, body included
+            http.DefaultRequestHeaders.UserAgent.ParseAdd($"ino-cli/{Commands.Version}");
+            try
+            {
+                using var res = await http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+                if (res.StatusCode != System.Net.HttpStatusCode.OK)
+                    throw new CliException(ExitCodes.Network, "DOWNLOAD_FAILED", $"{uri.Host} answered {(int)res.StatusCode} for {d.Path}; nothing was written.");
+                if (res.Content.Headers.ContentLength is { } len && len != d.Bytes)
+                    throw new CliException(ExitCodes.Business, "DIGEST_MISMATCH", $"The file is {len} bytes, the approved one {d.Bytes}; nothing was written.");
+                await using var stream = await res.Content.ReadAsStreamAsync(cts.Token);
+                var buffer = new byte[d.Bytes + 1];
+                var read = 0;
+                int n;
+                while (read < buffer.Length && (n = await stream.ReadAsync(buffer.AsMemory(read), cts.Token)) > 0) read += n;
+                if (read != d.Bytes) throw new CliException(ExitCodes.Business, "DIGEST_MISMATCH", $"The file is not the approved size ({d.Bytes} bytes); nothing was written.");
+                body = buffer[..read];
+            }
+            catch (HttpRequestException x) { throw new CliException(ExitCodes.Network, "DOWNLOAD_FAILED", $"Cannot reach {uri.Host}: {x.Message}"); }
+            catch (IOException x) { throw new CliException(ExitCodes.Network, "DOWNLOAD_FAILED", $"The download from {uri.Host} broke off: {x.Message}"); }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested) { throw new CliException(ExitCodes.Network, "DOWNLOAD_FAILED", $"{uri.Host} did not answer within 30 seconds."); }
+        }
+        if (Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(body)) != d.Sha256)
+            throw new CliException(ExitCodes.Business, "DIGEST_MISMATCH", $"The file at {uri.Host} is not the one Tryino approved (SHA-256 differs); nothing was written.");
+
+        // The same reading as saving: no BOM, strict UTF-8, no duplicate keys (review IL9b m2).
+        if (body.Length >= 3 && body[0] == 0xEF && body[1] == 0xBB && body[2] == 0xBF) throw Mismatch("it starts with a byte order mark");
+        try { _ = new System.Text.UTF8Encoding(false, true).GetString(body); } catch (System.Text.DecoderFallbackException) { throw Mismatch("it is not valid UTF-8"); }
+        JsonElement root;
+        try
+        {
+            using var doc = JsonDocument.Parse(body, new JsonDocumentOptions { AllowDuplicateProperties = false, CommentHandling = JsonCommentHandling.Skip, MaxDepth = 64 });
+            root = doc.RootElement.Clone();
+        }
+        catch (JsonException) { throw Mismatch("it is not valid JSON (or repeats a key)"); }
+        if (root.ValueKind != JsonValueKind.Object) throw Mismatch("it is not a JSON object");
+        string? S(string k) => root.ValueKind == JsonValueKind.Object && root.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+        var shape = root.TryGetProperty("marketing", out _) ? "marketing" : root.TryGetProperty("posFile", out _) ? "posFile" : "connector";
+        var requires = root.TryGetProperty("requires", out var rq) && rq.ValueKind == JsonValueKind.Array ? rq.EnumerateArray().Select(x => x.ToString()).Order(StringComparer.Ordinal).ToList() : [];
+        if (S("id") != e.Id || S("version") != d.Version || S("category") != d.Category || shape != d.Shape
+            || !requires.SequenceEqual(d.Requires.Order(StringComparer.Ordinal), StringComparer.Ordinal))
+            throw Mismatch("its id, version, category, kind or requires are not what the catalog says");
+
+        var bytes = asOwn is null ? body : ReplaceTopLevelId(body, asOwn);
+        if (bytes.Length > HubEnvelope.MaxDefinitionBytes) throw new CliException(ExitCodes.Business, "TOO_LARGE", "With your id the file is over 512 KB; choose a shorter id.");
+        FileStream fs;
+        try { fs = new FileStream(file, FileMode.CreateNew, FileAccess.Write, FileShare.None, bufferSize: 1); }
+        catch (IOException) when (File.Exists(file) || Directory.Exists(file))
+        { throw new CliException(ExitCodes.Usage, "FILE_EXISTS", $"{file} already exists; nothing was written. Choose another --out."); }
+        // Review (IL9b-1 1): a failed write or flush removes the file; it is never left half written.
+        try { await using (fs) { await fs.WriteAsync(bytes, ct); await fs.FlushAsync(ct); } }
+        catch { try { File.Delete(file); } catch (IOException) { } throw; }
+        return new DownloadedDefinition(file, asOwn ?? e.Id, d.Version, d.Shape, bytes.Length, asOwn is not null);
+
+        CliException Mismatch(string why) => new(ExitCodes.Business, "DEFINITION_MISMATCH", $"The approved file cannot be used: {why}; nothing was written.");
+    }
+
+    /// <summary>Replaces only the bytes of the top-level "id" string (quotes included) with the JSON string of <paramref name="id"/>.</summary>
+    public static byte[] ReplaceTopLevelId(byte[] body, string id)
+    {
+        var reader = new Utf8JsonReader(body, new JsonReaderOptions { CommentHandling = JsonCommentHandling.Skip });
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.PropertyName && reader.CurrentDepth == 1 && reader.ValueTextEquals("id"u8))
+            {
+                if (!reader.Read() || reader.TokenType != JsonTokenType.String) break;
+                var start = (int)reader.TokenStartIndex;
+                var end = (int)reader.BytesConsumed;
+                var replacement = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(id));
+                return [.. body[..start], .. replacement, .. body[end..]];
+            }
+            // A nested value of another top-level property: skip it whole (an "id" inside it is not the package id).
+            if (reader.CurrentDepth == 1 && reader.TokenType is JsonTokenType.StartObject or JsonTokenType.StartArray) reader.Skip();
+        }
+        throw new CliException(ExitCodes.Business, "DEFINITION_MISMATCH", "The file has no top-level id.");
+    }
+
     public static string GetCommands(HubEntry e) =>
         $"git clone {e.Mirror} {e.Id}\ncd {e.Id} && git checkout {e.Commit}\n# Tryino approved this exact commit ({e.ApprovedAt:yyyy-MM-dd}). Original repository: {e.Repository}";
 }

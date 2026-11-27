@@ -19,7 +19,14 @@ public sealed record HubEntry(
     string Id, string Name, string Kind, string Category, string Platform, string Vendor, string Description,
     IReadOnlyList<string> Languages, string License, string Version, string Suite, bool SelfReported,
     DateTimeOffset ApprovedAt, string Reviewer, string SupportLevel, string Runtime,
-    string Repository, string Commit, string? Tag, string Mirror);
+    string Repository, string Commit, string? Tag, string Mirror, HubDefinitionArtifact? Definition = null);
+
+/// <summary>
+/// IL9b (docs/INTEGRATION_LAYER.md §14.2-14.3): a definition package the catalog carries by reference: the file at <see cref="Path"/> in the mirror at the
+/// entry's commit, whose bytes hash to <see cref="Sha256"/>. <see cref="Shape"/>: connector (a shop or POS connector), marketing (a marketing tool),
+/// posFile (a POS file format). The engine only lists it; the CLI downloads and checks it (T35-T37).
+/// </summary>
+public sealed record HubDefinitionArtifact(string Path, string Sha256, int Bytes, string Version, string Category, string Shape, IReadOnlyList<string> Requires);
 
 public sealed record HubWithdrawal(string Id, string Reason, DateTimeOffset At);
 
@@ -43,6 +50,13 @@ public static partial class HubEnvelope
     static readonly string[] Hosts = ["github.com", "gitlab.com", "dev.azure.com"];
 
     [GeneratedRegex("^[0-9a-f]{40}$")] private static partial Regex CommitRe();
+    [GeneratedRegex("^[0-9a-f]{64}$")] private static partial Regex Sha256Re();
+    // A definition's mirror is exactly https://github.com/<owner>/<repo> (review IL9b: the raw address is derived from it).
+    [GeneratedRegex("^https://github\\.com/(?<owner>[A-Za-z0-9-]{1,39})/(?<repo>(?!\\.{1,2}$)[A-Za-z0-9._-]{1,100})$")] public static partial Regex GitHubRepoRe();
+    // A relative path of plain segments ending in .json: no leading '/', no empty, '.' or '..' segment.
+    [GeneratedRegex("^(?!.*(?:^|/)\\.{1,2}(?:/|$))[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*\\.json$")] private static partial Regex DefinitionPathRe();
+    public const int MaxDefinitionBytes = 512 * 1024;
+    public static readonly string[] DefinitionShapes = ["connector", "marketing", "posFile"];
     [GeneratedRegex("^[A-Za-z0-9_.-]{1,40}$")] private static partial Regex KeyIdRe();
     // Repository and mirror links are shown and printed as commands: plain path characters only (no newline, ;, $, backtick, quote).
     [GeneratedRegex("^https://[A-Za-z0-9.-]+/[A-Za-z0-9._~/-]+$")] private static partial Regex PlainUrlRe();
@@ -144,7 +158,7 @@ public static partial class HubEnvelope
         var kind = Text(e, "kind", 20);
         if (kind is not ("sales" or "marketing")) return null;
         var runtime = Text(e, "runtime", 20) ?? "self-hosted";
-        if (runtime != "self-hosted") return null;   // "definition" (P3b) is reserved: it needs artifact checks this version does not have
+        if (runtime is not ("self-hosted" or "definition")) return null;
         if (e["source"] is not JsonObject src) return null;
         var commit = Text(src, "commit", 40);
         if (commit is null || !CommitRe().IsMatch(commit)) return null;
@@ -159,9 +173,42 @@ public static partial class HubEnvelope
         var languages = (e["languages"] as JsonArray ?? []).Select(l => l!.GetValue<string>()).Where(l => l is "node" or "python" or "csharp" or "java" or "go").Distinct().ToList();
         var selfReported = true;
         if (e["selfReported"] is { } sr && (sr is not JsonValue srv || !srv.TryGetValue(out selfReported))) return null;
+        HubDefinitionArtifact? definition = null;
+        if (runtime == "definition" && (definition = ParseDefinition(e, src, id, kind, mirror!)) is null) return null;
         return new HubEntry(id, name, kind, Text(e, "category", 30) ?? "OTHER", Text(e, "platform", 80) ?? "", vendor, Text(e, "description", 2000) ?? "",
             languages, Text(e, "license", 40) ?? "", Text(e, "version", 40) ?? "", Text(e, "suite", 20) ?? "", selfReported,
-            approved.Value, Text(e, "reviewer", 40) ?? "", "approved", runtime, repo!, commit, Text(src, "tag", 100), mirror!);
+            approved.Value, Text(e, "reviewer", 40) ?? "", "approved", runtime, repo!, commit, Text(src, "tag", 100), mirror!, definition);
+    }
+
+    /// <summary>
+    /// IL9b: a definition entry names one file (format 1) by path, digest and size, with the package's own version, category and shape; the shape
+    /// matches the kind (marketing ↔ marketing). Anything else drops the entry, like every other malformed entry (T36, T40).
+    /// </summary>
+    static HubDefinitionArtifact? ParseDefinition(JsonObject e, JsonObject src, string id, string kind, string mirror)
+    {
+        if (e["definition"] is not JsonObject d) return null;
+        if (d["format"] is not JsonValue fv || !fv.TryGetValue<int>(out var format) || format != 1) return null;
+        if (!ConnectorIds.IsPackage(id) || ConnectorIds.Publisher(id) == ConnectorIds.LocalPublisher) return null;
+        if (!GitHubRepoRe().IsMatch(mirror) || mirror.EndsWith(".git", StringComparison.OrdinalIgnoreCase)) return null;
+        var path = Text(src, "path", 200);
+        if (path is null || !DefinitionPathRe().IsMatch(path) || path.Contains("//", StringComparison.Ordinal)) return null;
+        var sha = Text(d, "sha256", 64);
+        if (sha is null || !Sha256Re().IsMatch(sha)) return null;
+        if (d["bytes"] is not JsonValue bv || !bv.TryGetValue<int>(out var bytes) || bytes is < 1 or > MaxDefinitionBytes) return null;
+        var version = Text(d, "version", 20);
+        var category = Text(d, "category", 20);
+        var shape = Text(d, "shape", 20);
+        if (version is null || category is not ("ECOMMERCE" or "POS" or "MARKETING") || shape is null || !DefinitionShapes.Contains(shape)) return null;
+        if ((shape == "marketing") != (kind == "marketing") || (shape == "marketing") != (category == "MARKETING") || (shape == "posFile" && category != "POS")) return null;
+        var requires = new List<string>();
+        if (d["requires"] is { } rq)
+        {
+            if (rq is not JsonArray ra || ra.Count > 20) return null;
+            foreach (var r in ra)
+                if (r is JsonValue rv && rv.TryGetValue<string>(out var feature) && feature.Length is > 0 and <= 40 && feature.All(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '_')) requires.Add(feature);
+                else return null;
+        }
+        return new HubDefinitionArtifact(path, sha, bytes, version, category, shape, requires);
     }
 
     static string? Text(JsonObject o, string name, int max)
