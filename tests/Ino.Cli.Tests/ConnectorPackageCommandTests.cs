@@ -24,7 +24,7 @@ public class ConnectorPackageCommandTests
                 case "/oauth/token" when form["grant_type"] == "authorization_code": return RouteHandler.Json($$"""{"access_token":"{{token}}","refresh_token":"rt-1"}""");
                 case "/oauth/token": return RouteHandler.Json($$"""{"access_token":"{{token}}","refresh_token":"rt-x"}""");
                 case "/t/tabc1234/manage/v1/connector-packages" when req.Method == HttpMethod.Get:
-                    return RouteHandler.Json("""{"data":{"packages":[{"id":"local_pos","version":"1.0.0","status":"loaded","installations":0,"bytes":420}]}}""");
+                    return RouteHandler.Json("""{"data":{"packages":[{"id":"local_pos","version":"1.0.0","status":"loaded","installations":0,"bytes":420},{"id":"local_harbor-pos","version":"1.2.0","status":"loaded","installations":1,"bytes":764,"origin":{"hubId":"harborlane_harbor-pos","version":"1.2.0","signedByTryino":true,"withdrawn":true,"withdrawnReason":"Sends the loyalty id to a third party","hubLatestVersion":"1.3.0"}}]}}""");
                 case "/t/tabc1234/manage/v1/connector-packages" when req.Method == HttpMethod.Post:
                     Posts.Add((req.RequestUri.AbsolutePath, body, req.Content?.Headers.ContentType?.MediaType));
                     if (Posts.Count <= FailFirstPosts) throw new HttpRequestException("connection reset");
@@ -196,5 +196,17 @@ public class ConnectorPackageCommandTests
         Assert.Contains("amountScale", problems);
         // Checking never saves.
         Assert.DoesNotContain(f.Posts, p => p.Path.EndsWith("/connector-packages", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task List_shows_an_unchanged_hub_copy_and_a_withdrawal()
+    {
+        var (h, _) = await SignedIn();
+        using var hh = h;
+        var (code, output, err) = await h.Run("--profile", "dev", "connector", "package", "list");
+        Assert.True(code == ExitCodes.Ok, err);
+        Assert.Contains("unchanged copy of Hub harborlane_harbor-pos 1.2.0", output);
+        Assert.Contains("WITHDRAWN from the Hub: Sends the loyalty id to a third party", output);
+        Assert.Contains("the Hub has version 1.3.0", output);
     }
 }

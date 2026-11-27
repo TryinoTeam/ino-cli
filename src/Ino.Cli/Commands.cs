@@ -590,8 +590,9 @@ public static class Commands
             var created = data?["created"]?.GetValue<bool>() == true;
             var result = new JsonObject { ["id"] = data?["id"]?.DeepClone(), ["version"] = data?["version"]?.DeepClone(), ["sha256"] = data?["sha256"]?.DeepClone(),
                 ["created"] = created, ["host"] = data?["access"]?["requestHost"]?["defaultHost"]?.DeepClone() };
+            result["origin"] = data?["origin"]?.DeepClone();
             Write(ctx, pr.GetValue(json), result, $"{(created ? "Saved" : "Already saved")} {data?["id"]} {data?["version"]} (sha256 {data?["sha256"]?.ToString()[..12]}…). " +
-                "It is not installed anywhere yet.");
+                "It is not installed anywhere yet." + OriginText(data?["origin"]));
         });
         // IL9a: the engine's package rules on a file, without saving it: every rule it breaks, or the summary a person reviews before installing.
         var cFile = new Argument<string>("file") { Description = "connector.json to check (nothing is saved)" };
@@ -615,13 +616,18 @@ public static class Commands
             else ctx.Out.WriteLine($"{errors.Count} problem{(errors.Count == 1 ? "" : "s")}:\n" + string.Join("\n", errors.Select(x => "  - " + x)));
             if (!ok) throw new CliException(ExitCodes.Business, "INVALID_DEFINITION", "The definition does not pass the engine's package rules; fix the problems listed and check again.");
         });
+        // IL9b-2: what the engine found about a package's origin (an unchanged copy of a Hub definition) and a Hub withdrawal it has seen.
+        static string OriginText(JsonNode? o) => o is not JsonObject origin ? ""
+            : $"\n    unchanged copy of Hub {origin["hubId"]} {origin["version"]}{(origin["signedByTryino"]?.GetValue<bool>() == false ? " (TEST catalog)" : "")}"
+              + (origin["withdrawn"]?.GetValue<bool>() == true ? $"\n    WITHDRAWN from the Hub: {origin["withdrawnReason"]} (it keeps running; review it and replace it)" : "")
+              + (origin["hubLatestVersion"] is { } latest ? $"\n    the Hub has version {latest}" : "");
         var packageList = new Command("list", "Your own connector definitions in this tenant, with versions and how many installations use each");
         Bind(packageList, async pr =>
         {
             var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
             var data = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Get, "connector-packages", null, null, ct);
             var rows = data?["packages"]?.AsArray() ?? [];
-            var lines = rows.OfType<JsonObject>().Select(r => $"{r["id"],-30} {r["version"],-10} {r["status"],-12} {r["installations"]} installation(s)  {r["bytes"]} bytes");
+            var lines = rows.OfType<JsonObject>().Select(r => $"{r["id"],-30} {r["version"],-10} {r["status"],-12} {r["installations"]} installation(s)  {r["bytes"]} bytes{OriginText(r["origin"])}");
             Write(ctx, pr.GetValue(json), data ?? new JsonObject(), rows.Count == 0 ? "No own connectors saved yet. Save one with `ino connector package save connector.json`." : string.Join("\n", lines));
         });
         var pId = new Argument<string>("id") { Description = "The connector id (local_…)" };
@@ -851,6 +857,135 @@ public static class Commands
         });
         channelsCmd.Subcommands.Add(channelsList);
         root.Subcommands.Add(channelsCmd);
+
+        // ---------------------------------------------------------------- logs (MC1, docs/MCP_CLI.md §4: `ino logs tail`)
+        var logsCmd = new Command("logs", "What the engine saw: requests to this tenant's channel API (no member data, no bodies); needs `ino login`");
+        var lgChannel = new Option<string?>("--channel") { Description = "Only this channel" };
+        var lgOutcome = new Option<string?>("--outcome") { Description = "failed, success, auth, rate_limited, client_error or server_error" };
+        var lgOperation = new Option<string?>("--operation") { Description = "Only this operation, e.g. transaction.create" };
+        var lgSearch = new Option<string?>("--search") { Description = "A request id or correlation id" };
+        var lgLimit = new Option<int>("--limit") { Description = "How many of the newest requests (1-50)", DefaultValueFactory = _ => 20 };
+        var lgFollow = new Option<bool>("--follow", "-f") { Description = "Keep showing new requests until Ctrl-C" };
+        var lgInterval = new Option<int>("--interval") { Description = "With --follow: seconds between reads (2-60)", DefaultValueFactory = _ => 5 };
+        var logsTail = new Command("tail", "The newest requests, newest last; --follow keeps watching") { lgChannel, lgOutcome, lgOperation, lgSearch, lgLimit, lgFollow, lgInterval };
+        Bind(logsTail, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var target = InoLogin.TargetOf(prof.BaseUrl);
+            var limit = Math.Clamp(pr.GetValue(lgLimit), 1, 50);
+            var query = string.Join("&", new (string K, string? V)[] { ("channel", pr.GetValue(lgChannel)), ("outcome", pr.GetValue(lgOutcome)), ("operation", pr.GetValue(lgOperation)),
+                ("search", pr.GetValue(lgSearch)), ("limit", limit.ToString(System.Globalization.CultureInfo.InvariantCulture)) }
+                .Where(x => !string.IsNullOrWhiteSpace(x.V)).Select(x => $"{x.K}={Uri.EscapeDataString(x.V!.Trim())}"));
+            async Task<List<JsonObject>> Read() =>
+                ((await InoLogin.ManageAsync(ctx, name, target, HttpMethod.Get, "request-log?" + query, null, null, ct))?["requests"]?.AsArray() ?? [])
+                .OfType<JsonObject>().Reverse().ToList();   // oldest first, like a log
+            // Review MC1 1: paths, channels and errors come from callers; control characters never reach the terminal.
+            static string Safe(JsonNode? n) => n is null ? "" : new string(n.ToString().Select(c => char.IsControl(c) ? '?' : c).ToArray());
+            static string Line(JsonObject r) =>
+                $"{(DateTimeOffset.TryParse(r["createdAt"]?.ToString(), out var at) ? at.ToLocalTime().ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture) : "")} "
+                + $"{Safe(r["httpStatus"]),3} {Safe(r["channel"]),-16} {Safe(r["operation"] ?? r["path"]),-28} {Safe(r["durationMs"]),5} ms  {Safe(r["resultCode"])}"
+                + (r["requestId"] is { } rid ? $"  request {Safe(rid)}" : "") + (r["error"] is { } err ? $"\n      {Safe(err)}" : "");
+            var rows = await Read();
+            if (pr.GetValue(json) && !pr.GetValue(lgFollow)) { Write(ctx, true, new JsonObject { ["requests"] = new JsonArray(rows.Select(r => (JsonNode)r.DeepClone()).ToArray()) }, ""); return; }
+            if (rows.Count == 0 && !pr.GetValue(lgFollow)) { ctx.Out.WriteLine("No requests match."); return; }
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            void Show(IEnumerable<JsonObject> batch)
+            {
+                foreach (var r in batch.Where(r => seen.Add(r["id"]?.ToString() ?? "")))
+                    ctx.Out.WriteLine(pr.GetValue(json) ? r.ToJsonString() : Line(r));   // --json --follow: one JSON object per line
+            }
+            Show(rows);
+            if (!pr.GetValue(lgFollow)) return;
+            var wait = TimeSpan.FromSeconds(Math.Clamp(pr.GetValue(lgInterval), 2, 60));
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    await ctx.Delay(wait, ct);
+                    var batch = await Read();
+                    // Review MC1 2: a whole window of new requests means some came and went between two reads; say so.
+                    if (batch.Count >= limit && batch.All(r => !seen.Contains(r["id"]?.ToString() ?? "")) && seen.Count > 0)
+                        ctx.Err.WriteLine($"… more than {limit} requests since the last read; older ones were skipped (use --limit 50 or a filter).");
+                    Show(batch);
+                    if (seen.Count > 5000) { seen.Clear(); foreach (var r in batch) seen.Add(r["id"]?.ToString() ?? ""); }
+                }
+                // Review MC1 3: Ctrl-C ends with 0 wherever it lands; a passing network or server error does not end the watch.
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+                catch (CliException e) when (e.ExitCode is ExitCodes.Network or ExitCodes.RateLimited || e.Code is "UNAVAILABLE" or "TEMPORARILY_UNAVAILABLE")
+                { ctx.Err.WriteLine($"({e.Message} Trying again.)"); }
+                catch (HttpRequestException e) { ctx.Err.WriteLine($"({e.Message} Trying again.)"); }
+            }
+        });
+        logsCmd.Subcommands.Add(logsTail);
+        root.Subcommands.Add(logsCmd);
+
+        // ---------------------------------------------------------------- pos file-format (MC1, docs/INTEGRATION_LAYER.md §10.4)
+        var posCmd = new Command("pos", "Point of sale: the file format a channel's POS files are read with; needs `ino login`");
+        var ffCmd = new Command("file-format", "Which file format each channel's POS files are read with (default: Ino POS file v1)");
+        var ffList = new Command("list", "Every channel's pinned file format");
+        Bind(ffList, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var data = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Get, "channels/file-formats", null, null, ct);
+            var rows = data?["fileFormats"]?.AsArray() ?? [];
+            Write(ctx, pr.GetValue(json), data as JsonObject ?? new JsonObject(), rows.Count == 0 ? "No channel has a pinned format: every channel reads Ino POS file v1." : string.Join("\n", rows.Select(f =>
+                $"{f?["channel"],-18} {f?["fileFormat"],-32} {(f?["allowV1"]?.GetValue<bool>() == true ? "v1 too  " : "        ")}pinned {f?["pinnedAt"]}{(f?["channelConfigured"]?.GetValue<bool>() == false ? "  (channel no longer configured)" : "")}")));
+        });
+        var ffChannel = new Argument<string>("channel") { Description = "The channel code, e.g. STORE_TILLS" };
+        var ffDefinition = new Option<string>("--definition") { Description = "Your saved POS file package (local_…)", Required = true };
+        var ffVersion = new Option<string>("--version") { Description = "Its version", Required = true };
+        var ffAllowV1 = new Option<bool>("--allow-v1") { Description = "Also accept Ino POS file v1 files (during a vendor change)" };
+        var ffConfirm = new Option<string?>("--confirm") { Description = "The review hash the summary printed: pins the format" };
+        var ffSet = new Command("set", "Read a channel's files with your saved format package: the column summary first, then --confirm") { ffChannel, ffDefinition, ffVersion, ffAllowV1, ffConfirm };
+        Bind(ffSet, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var target = InoLogin.TargetOf(prof.BaseUrl);
+            var channel = Uri.EscapeDataString(pr.GetValue(ffChannel)!.Trim());
+            var body = new JsonObject { ["definition"] = pr.GetValue(ffDefinition), ["version"] = pr.GetValue(ffVersion) };
+            var preview = await InoLogin.ManageAsync(ctx, name, target, HttpMethod.Post, $"channels/{channel}/file-format/preview", body.DeepClone(), null, ct);
+            var reviewHash = preview?["reviewHash"]?.ToString() ?? throw new CliException(ExitCodes.Business, "NO_REVIEW", "Ino returned no review hash; update the engine.");
+            if (pr.GetValue(ffConfirm) != reviewHash)
+            {
+                if (pr.GetValue(json)) Write(ctx, true, new JsonObject { ["preview"] = preview?.DeepClone(), ["confirmed"] = false }, "");
+                else ctx.Out.WriteLine(PosFileText(preview));
+                throw new CliException(ExitCodes.Usage, "CONFIRM", pr.GetValue(ffConfirm) is null
+                    ? $"Review the columns above. To pin the format, run the same command with --confirm {reviewHash}"
+                    : $"The format, or the channel's current pin, changed since that review. Review it above; to pin, use --confirm {reviewHash}");
+            }
+            body["reviewHash"] = reviewHash;
+            body["allowV1"] = pr.GetValue(ffAllowV1);
+            var data = await InoLogin.ManageAsync(ctx, name, target, HttpMethod.Put, $"channels/{channel}/file-format", body, null, ct);
+            Write(ctx, pr.GetValue(json), data as JsonObject ?? new JsonObject(),
+                $"{pr.GetValue(ffChannel)} files are read with {data?["fileFormat"]}{(pr.GetValue(ffAllowV1) ? " (v1 files too)" : "")}" + (data?["previous"] is { } prev ? $"; was {prev}." : "."));
+        });
+        var ffYes = new Option<bool>("--yes", "-y") { Description = "Go back to v1 without asking" };
+        var ffClear = new Command("clear", "Read a channel's files as Ino POS file v1 again") { ffChannel, ffYes };
+        Bind(ffClear, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            if (!pr.GetValue(ffYes)) throw new CliException(ExitCodes.Usage, "CONFIRM", $"Run again with --yes to read {pr.GetValue(ffChannel)} files as Ino POS file v1 again.");
+            var data = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Delete, $"channels/{Uri.EscapeDataString(pr.GetValue(ffChannel)!.Trim())}/file-format", null, null, ct);
+            Write(ctx, pr.GetValue(json), data as JsonObject ?? new JsonObject(), data?["cleared"]?.GetValue<bool>() == true
+                ? $"{pr.GetValue(ffChannel)} files are read as Ino POS file v1 again (was {data?["previous"]})." : $"{pr.GetValue(ffChannel)} had no pinned format.");
+        });
+        static string PosFileText(JsonNode? d)
+        {
+            static IEnumerable<string> Items(JsonNode? n) => n is JsonArray arr ? arr.Select(x => x?.ToString() ?? "") : [];
+            var a = d?["access"];
+            var personal = Items(a?["personalData"] ?? a?["PersonalData"]).ToHashSet(StringComparer.Ordinal);
+            var lines = new List<string> { $"{d?["definition"]} {d?["version"]} for channel {d?["channel"]}{(d?["current"] is { } cur ? $" (now {cur})" : " (now Ino POS file v1)")}", "  Ino field = column in the vendor's file" };
+            foreach (var c in Items(a?["columns"] ?? a?["Columns"])) lines.Add($"    {c}{(personal.Contains(c.Split(" = ")[0]) ? "   (personal data)" : "")}");
+            if (Items(a?["recordTypes"] ?? a?["RecordTypes"]).ToList() is { Count: > 0 } rt) lines.Add($"  record types   {string.Join("; ", rt)}");
+            if (Items(a?["paymentTypes"] ?? a?["PaymentTypes"]).ToList() is { Count: > 0 } pt) lines.Add($"  payment types  {string.Join("; ", pt)}");
+            var scale = (a?["amountScale"] ?? a?["AmountScale"])?.ToString();
+            lines.Add($"  amounts        {(scale == "100" ? "in cents (divided by 100)" : "as written")}{((a?["dateFormat"] ?? a?["DateFormat"]) is { } df ? $" · dates {df}" : "")}");
+            lines.Add($"  review hash    {d?["reviewHash"]}");
+            return string.Join("\n", lines);
+        }
+        ffCmd.Subcommands.Add(ffList); ffCmd.Subcommands.Add(ffSet); ffCmd.Subcommands.Add(ffClear);
+        posCmd.Subcommands.Add(ffCmd);
+        root.Subcommands.Add(posCmd);
 
         var keysCmd = new Command("keys", "API keys of this tenant's channels; needs `ino login` (creating needs the integration:write scope, test tenants)");
         var keysList = new Command("list", "List API keys (prefix, channel, status, last use); secrets are never shown again");

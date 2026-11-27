@@ -181,6 +181,34 @@ public static partial class HubEnvelope
     }
 
     /// <summary>
+    /// IL9b: the bytes of <paramref name="body"/> with only the top-level "id" string (quotes included) replaced by the JSON string of
+    /// <paramref name="id"/>; null when there is no top-level string id. The CLI makes a firm's own copy with it (--as-own) and the engine checks a
+    /// saved copy against the catalog with it (IL9b-2): one implementation, so the two never drift.
+    /// </summary>
+    public static byte[]? ReplaceTopLevelId(byte[] body, string id)
+    {
+        try
+        {
+            var reader = new System.Text.Json.Utf8JsonReader(body, new System.Text.Json.JsonReaderOptions { CommentHandling = System.Text.Json.JsonCommentHandling.Skip });
+            while (reader.Read())
+            {
+                if (reader.TokenType == System.Text.Json.JsonTokenType.PropertyName && reader.CurrentDepth == 1 && reader.ValueTextEquals("id"u8))
+                {
+                    if (!reader.Read() || reader.TokenType != System.Text.Json.JsonTokenType.String) return null;
+                    var start = (int)reader.TokenStartIndex;
+                    var end = (int)reader.BytesConsumed;
+                    var replacement = Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(id));
+                    return [.. body[..start], .. replacement, .. body[end..]];
+                }
+                // A nested value of another top-level property: skipped whole (an "id" inside it is not the package id).
+                if (reader.CurrentDepth == 1 && reader.TokenType is System.Text.Json.JsonTokenType.StartObject or System.Text.Json.JsonTokenType.StartArray) reader.Skip();
+            }
+        }
+        catch (System.Text.Json.JsonException) { }
+        return null;
+    }
+
+    /// <summary>
     /// IL9b: a definition entry names one file (format 1) by path, digest and size, with the package's own version, category and shape; the shape
     /// matches the kind (marketing ↔ marketing). Anything else drops the entry, like every other malformed entry (T36, T40).
     /// </summary>

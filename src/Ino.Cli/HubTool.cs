@@ -297,25 +297,9 @@ public static partial class HubTool
         CliException Mismatch(string why) => new(ExitCodes.Business, "DEFINITION_MISMATCH", $"The approved file cannot be used: {why}; nothing was written.");
     }
 
-    /// <summary>Replaces only the bytes of the top-level "id" string (quotes included) with the JSON string of <paramref name="id"/>.</summary>
-    public static byte[] ReplaceTopLevelId(byte[] body, string id)
-    {
-        var reader = new Utf8JsonReader(body, new JsonReaderOptions { CommentHandling = JsonCommentHandling.Skip });
-        while (reader.Read())
-        {
-            if (reader.TokenType == JsonTokenType.PropertyName && reader.CurrentDepth == 1 && reader.ValueTextEquals("id"u8))
-            {
-                if (!reader.Read() || reader.TokenType != JsonTokenType.String) break;
-                var start = (int)reader.TokenStartIndex;
-                var end = (int)reader.BytesConsumed;
-                var replacement = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(id));
-                return [.. body[..start], .. replacement, .. body[end..]];
-            }
-            // A nested value of another top-level property: skip it whole (an "id" inside it is not the package id).
-            if (reader.CurrentDepth == 1 && reader.TokenType is JsonTokenType.StartObject or JsonTokenType.StartArray) reader.Skip();
-        }
-        throw new CliException(ExitCodes.Business, "DEFINITION_MISMATCH", "The file has no top-level id.");
-    }
+    /// <summary>Replaces only the bytes of the top-level "id" string (shared with the engine: HubEnvelope.ReplaceTopLevelId).</summary>
+    public static byte[] ReplaceTopLevelId(byte[] body, string id) => HubEnvelope.ReplaceTopLevelId(body, id)
+        ?? throw new CliException(ExitCodes.Business, "DEFINITION_MISMATCH", "The file has no top-level id.");
 
     public static string GetCommands(HubEntry e) =>
         $"git clone {e.Mirror} {e.Id}\ncd {e.Id} && git checkout {e.Commit}\n# Tryino approved this exact commit ({e.ApprovedAt:yyyy-MM-dd}). Original repository: {e.Repository}";
