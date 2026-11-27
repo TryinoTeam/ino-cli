@@ -593,6 +593,28 @@ public static class Commands
             Write(ctx, pr.GetValue(json), result, $"{(created ? "Saved" : "Already saved")} {data?["id"]} {data?["version"]} (sha256 {data?["sha256"]?.ToString()[..12]}…). " +
                 "It is not installed anywhere yet.");
         });
+        // IL9a: the engine's package rules on a file, without saving it: every rule it breaks, or the summary a person reviews before installing.
+        var cFile = new Argument<string>("file") { Description = "connector.json to check (nothing is saved)" };
+        var packageCheck = new Command("check", "Check a definition against the engine's package rules without saving it: every problem at once, or what it would do") { cFile };
+        Bind(packageCheck, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var path = pr.GetValue(cFile)!;
+            if (!File.Exists(path)) throw new CliException(ExitCodes.Usage, "NO_FILE", $"{path} does not exist.");
+            if (new FileInfo(path).Length > 512 * 1024) throw new CliException(ExitCodes.Usage, "TOO_LARGE", "A connector definition is at most 512 KB.");
+            var data = await InoLogin.ManageRawAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), "connector-packages/check", await File.ReadAllBytesAsync(path, ct), ct);
+            var ok = data?["ok"]?.GetValue<bool>() == true;
+            var errors = data?["errors"] is JsonArray e ? e.Select(x => x?.ToString() ?? "").ToList() : [];
+            if (pr.GetValue(json)) Write(ctx, true, data?.DeepClone() as JsonObject ?? new JsonObject(), "");
+            else if (ok)
+            {
+                var hosts = data?["access"]?["requestHost"]?["defaultHost"]?.ToString();
+                ctx.Out.WriteLine($"{data?["id"]} {data?["version"]} ({data?["category"]}) passes the engine's package rules." + (hosts is { Length: > 0 } ? $" Calls {hosts}." : ""));
+                ctx.Out.WriteLine($"Access hash {data?["accessHash"]}. Save it with: ino connector package save {path}");
+            }
+            else ctx.Out.WriteLine($"{errors.Count} problem{(errors.Count == 1 ? "" : "s")}:\n" + string.Join("\n", errors.Select(x => "  - " + x)));
+            if (!ok) throw new CliException(ExitCodes.Business, "INVALID_DEFINITION", "The definition does not pass the engine's package rules; fix the problems listed and check again.");
+        });
         var packageList = new Command("list", "Your own connector definitions in this tenant, with versions and how many installations use each");
         Bind(packageList, async pr =>
         {
@@ -714,6 +736,25 @@ public static class Commands
         package.Subcommands.Add(packageDelete);
         package.Subcommands.Add(packagePreview);
         package.Subcommands.Add(packageInstall);
+        package.Subcommands.Add(packageCheck);
+        // IL9a: a package skeleton of each kind (marketing tool, e-commerce platform, POS file format) that passes the package rules as it is.
+        var cdDir = new Argument<string>("folder") { Description = "A new folder for the package (connector.json and RULES.md)" };
+        var cdId = new Option<string>("--id") { Description = "The package id, local_<name> (lower case, digits and -)", Required = true };
+        var cdKind = new Option<string>("--kind") { Description = "marketing (a marketing tool), ecommerce (a shop's orders and refunds), pos (a POS file format)", Required = true };
+        cdKind.AcceptOnlyFromAmong(DefinitionScaffold.Kinds);
+        var cdNew = new Command("new", "Write a definition package skeleton that passes the engine's package rules; edit it, then `ino connector package check`") { cdDir, cdId, cdKind };
+        Bind(cdNew, pr =>
+        {
+            var dir = pr.GetValue(cdDir)!;
+            var files = DefinitionScaffold.Create(dir, pr.GetValue(cdId)!, pr.GetValue(cdKind)!);
+            Write(ctx, pr.GetValue(json), new JsonObject { ["dir"] = dir, ["kind"] = pr.GetValue(cdKind), ["files"] = new JsonArray(files.Select(f => (JsonNode)f).ToArray()) },
+                $"Created {dir} ({files.Count} files). RULES.md lists what a {pr.GetValue(cdKind)} package may do. Edit connector.json, then:\n" +
+                $"  ino connector package check {Path.Combine(dir, "connector.json")}\n  ino connector package save {Path.Combine(dir, "connector.json")}");
+            return Task.CompletedTask;
+        });
+        var cdefinition = new Command("definition", "Definition packages: connectors described by a file the engine runs (no code to host)");
+        cdefinition.Subcommands.Add(cdNew);
+        connector.Subcommands.Add(cdefinition);
         connector.Subcommands.Add(package);
         connector.Subcommands.Add(check);
         connector.Subcommands.Add(newCmd);
@@ -1395,6 +1436,64 @@ public static class Commands
                 $"Key replaced; the connection is {data?["status"]?.ToString().ToLowerInvariant()}. Run: ino marketing verify {id:D}");
         });
         marketing.Subcommands.Add(mKey);
+        // IL3b-4: move a connection made through your own package to another saved version of it (the summary first, then --confirm).
+        var rpVersion = new Option<string>("--version") { Description = "The saved package version to move to", Required = true };
+        var rpSetting = new Option<string[]>("--setting") { Description = "key=value for a setting the new version adds (saved values never change)", AllowMultipleArgumentsPerToken = false };
+        var rpConfirm = new Option<string?>("--confirm") { Description = "The review hash the summary printed: moves the connection" };
+        var mRepin = new Command("repin", "Move a connection made through your own package to another saved version of it; a live one pauses until `ino marketing verify`") { mId, rpVersion, rpSetting, rpConfirm };
+        Bind(mRepin, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var id = pr.GetValue(mId);
+            var target = InoLogin.TargetOf(prof.BaseUrl);
+            var settings = new JsonObject();
+            foreach (var kv in pr.GetValue(rpSetting) ?? [])
+            {
+                var at = kv.IndexOf('=');
+                if (at <= 0) throw new CliException(ExitCodes.Usage, "BAD_SETTING", $"--setting {kv}: write it as key=value.");
+                settings[kv[..at].Trim()] = kv[(at + 1)..].Trim();
+            }
+            var body = new JsonObject { ["version"] = pr.GetValue(rpVersion), ["settings"] = settings };
+            var preview = await InoLogin.ManageAsync(ctx, name, target, HttpMethod.Post, $"marketing/connections/{id:D}/repin/preview", body.DeepClone(), null, ct);
+            var reviewHash = preview?["reviewHash"]?.ToString() ?? throw new CliException(ExitCodes.Business, "NO_REVIEW", "Ino returned no review hash; update the engine.");
+            if (pr.GetValue(rpConfirm) != reviewHash)
+            {
+                if (pr.GetValue(json)) Write(ctx, true, new JsonObject { ["preview"] = preview?.DeepClone(), ["confirmed"] = false }, "");
+                else ctx.Out.WriteLine(RepinText(preview));
+                throw new CliException(ExitCodes.Usage, "CONFIRM", pr.GetValue(rpConfirm) is null
+                    ? $"Review what changes above. To move the connection, run the same command with --confirm {reviewHash}"
+                    : $"What the new version sends, or where, or the version it moves from, changed since that review. Review it above; to move, use --confirm {reviewHash}");
+            }
+            body["reviewHash"] = reviewHash;
+            // One Idempotency-Key for this move: a retry after a lost answer gets the same answer (and no second audit row).
+            var data = await KeyWrite(name, target, $"marketing/connections/{id:D}/repin", body,
+                $"Ino did not confirm the move. Run `ino marketing list`: if {id:D} still runs with its old version, run the same command again.");
+            var status = data?["status"]?.ToString() ?? "";
+            Write(ctx, pr.GetValue(json), new JsonObject { ["connectionId"] = id.ToString("D"), ["from"] = data?["from"]?.DeepClone(), ["version"] = data?["version"]?.DeepClone(),
+                ["status"] = status, ["unchanged"] = data?["unchanged"]?.DeepClone() },
+                data?["unchanged"]?.GetValue<bool>() == true ? $"Nothing changed: the connection already runs with {data?["version"]}."
+                    : $"Moved from {data?["from"]} to {data?["version"]}; the connection is {status.ToLowerInvariant()}." + (status == "PAUSED" || status == "PENDING_CONFIRM"
+                        ? $" Profiles and events wait until: ino marketing verify {id:D}" : ""));
+        });
+        marketing.Subcommands.Add(mRepin);
+
+        static string RepinText(JsonNode? d)
+        {
+            static IEnumerable<string> Items(JsonNode? n) => n is JsonArray arr ? arr.Select(x => x?.ToString() ?? "") : [];
+            var x = d?["diff"];
+            var lines = new List<string> { $"{d?["definition"]} {d?["from"]} → {d?["version"]} (after the move: {d?["statusAfter"]?.ToString().ToLowerInvariant()})" };
+            if (x?["previousUnavailable"]?.GetValue<bool>() == true) lines.Add("  the current version can no longer be read: no comparison is possible, review the whole summary");
+            void Section(string title, string key) { if (x?[key] is JsonArray { Count: > 0 } a) lines.Add($"  {title,-22} {string.Join("; ", Items(a))}"); }
+            Section("operations added", "operationsAdded"); Section("operations removed", "operationsRemoved");
+            Section("fields added", "fieldsAdded"); Section("fields removed", "fieldsRemoved");
+            Section("events newly sent", "eventsNewlySent"); Section("events no longer sent", "eventsNoLongerSent");
+            Section("settings added", "settingsAdded"); Section("settings dropped", "settingsDropped");
+            if (x?["unsubscribeReadingLost"]?.GetValue<bool>() == true) lines.Add("  NOTE                   the new version no longer reads unsubscribes made in the tool");
+            if (x?["unsubscribeReadingAdded"]?.GetValue<bool>() == true) lines.Add("  NOTE                   the new version reads unsubscribes made in the tool");
+            lines.Add($"  sends to               {string.Join(", ", Items(d?["hosts"]))}");
+            lines.Add($"  review hash            {d?["reviewHash"]}");
+            return string.Join("\n", lines);
+        }
         var defDir = new Argument<string>("folder") { Description = "A new folder for the package (connector.json and RULES.md)" };
         var defName = new Option<string>("--id") { Description = "The package id, local_<name> (lower case, digits and -)", Required = true };
         var defNew = new Command("new", "Write a marketing tool package skeleton that follows the engine's package rules; edit it, then `ino connector package save`") { defDir, defName };

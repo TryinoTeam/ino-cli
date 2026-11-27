@@ -52,6 +52,17 @@ public class MarketingDefinitionCommandTests
                     Posts.Add((path, text));
                     return RouteHandler.Json("""{"data":{"connectionId":"__ID__","definition":"local_acme-mailer","version":"1.0.0","hosts":["api.acme-mailer.example.com"],"status":"PENDING_CONFIRM","existing":__EX__}}"""
                         .Replace("__ID__", Id).Replace("__EX__", Existing ? "true" : "false"));
+                case prefix + "marketing/connections/" + Id + "/repin/preview":
+                    Posts.Add((path, text));
+                    return RouteHandler.Json("""
+                        {"data":{"connectionId":"__ID__","definition":"local_acme-mailer","from":"1.0.0","version":"1.1.0","sha256":"0123abcd","hosts":["api.acme-mailer.example.com"],
+                         "reviewHash":"__RH__","statusAfter":"PAUSED","diff":{"previousUnavailable":false,"operationsAdded":[],"operationsRemoved":[],
+                         "fieldsAdded":["POST /events (trackEvent): kind"],"fieldsRemoved":[],"eventsNewlySent":[],"eventsNoLongerSent":[],"settingsAdded":["region"],
+                         "settingsDropped":[],"unsubscribeReadingLost":true,"unsubscribeReadingAdded":false,"identityChanged":false}}}
+                        """.Replace("__ID__", Id).Replace("__RH__", ReviewHash));
+                case prefix + "marketing/connections/" + Id + "/repin":
+                    Posts.Add((path, text));
+                    return RouteHandler.Json($$$"""{"data":{"connectionId":"{{{Id}}}","definition":"local_acme-mailer","from":"1.0.0","version":"1.1.0","sha256":"0123abcd","status":"PAUSED","unchanged":false}}""");
                 case prefix + "marketing/connections/" + Id + "/key":
                     Posts.Add((path, text));
                     return RouteHandler.Json($$$"""{"data":{"connectionId":"{{{Id}}}","status":"PAUSED","verify":true}}""");
@@ -205,5 +216,26 @@ public class MarketingDefinitionCommandTests
         Assert.Contains("ino connector package save", output);
         Assert.Equal(ExitCodes.Usage, (await h.Run("marketing", "definition", "new", dir, "--id", "local_acme-mailer")).Code);
         Assert.Equal(ExitCodes.Usage, (await h.Run("marketing", "definition", "new", Path.Combine(h.Dir, "b"), "--id", "acme")).Code);
+    }
+
+    [Fact]
+    public async Task Repin_shows_what_changes_first_and_moves_only_with_the_review_hash()
+    {
+        var (h, f) = await SignedIn();
+        using var hh = h; using var ff = f;
+        var (code, output, _) = await h.Run("--profile", "dev", "marketing", "repin", Id, "--version", "1.1.0", "--setting", "region=us");
+        Assert.Equal(ExitCodes.Usage, code);
+        Assert.Contains("1.0.0 → 1.1.0", output);
+        Assert.Contains("POST /events (trackEvent): kind", output);
+        Assert.Contains("no longer reads unsubscribes", output);
+        Assert.DoesNotContain(f.Posts, p => p.Path.EndsWith("/repin", StringComparison.Ordinal));
+        Assert.Equal("us", JsonNode.Parse(f.Posts.Single(p => p.Path.EndsWith("/repin/preview", StringComparison.Ordinal)).Body)!["settings"]!["region"]!.ToString());
+
+        Assert.Equal(ExitCodes.Usage, (await h.Run("--profile", "dev", "marketing", "repin", Id, "--version", "1.1.0", "--confirm", "r1:old")).Code);
+        var (ok, moved, err) = await h.Run("--profile", "dev", "marketing", "repin", Id, "--version", "1.1.0", "--setting", "region=us", "--confirm", Review);
+        Assert.True(ok == ExitCodes.Ok, err);
+        var body = JsonNode.Parse(f.Posts.Single(p => p.Path.EndsWith("/repin", StringComparison.Ordinal)).Body)!;
+        Assert.Equal((Review, "1.1.0"), (body["reviewHash"]!.ToString(), body["version"]!.ToString()));
+        Assert.Contains($"ino marketing verify {Id}", moved);
     }
 }

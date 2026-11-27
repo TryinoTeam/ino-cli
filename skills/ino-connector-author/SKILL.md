@@ -1,7 +1,42 @@
 ---
 name: ino-connector-author
-description: Build a self-hosted Ino Loyalty connector (an adapter that runs on the customer's or partner's server and links a shop, POS or other platform to the Ino channel API), from scaffold to a passing compatibility report. Use when someone wants to connect a platform Ino has no ready connector for, or connect their own marketing tool (e-mail, SMS, CDP) to Ino's Marketing Activation.
+description: Connect a platform Ino Loyalty has no ready connector for (a shop, a POS, a marketing tool such as e-mail, SMS or a CDP). First choice is a definition package (a connector.json the Ino engine runs, no code to host); otherwise a self-hosted connector (an adapter on the customer's or partner's server). Use when someone wants to connect such a platform, write or fix a connector.json, read a POS vendor's file format, or move a marketing connection to a new package version.
 ---
+
+# Connecting a platform to Ino
+
+## First choice: a definition package (runs in Ino, no code to host)
+
+A definition package is one `connector.json` the Ino engine runs. Consent, deletions, retries, duplicate checks, the credential vault and the audit
+trail stay in the engine; the file only says how the platform's calls and events map to Ino. Use it whenever the platform has an HTTP API (or, for a
+POS, a sales file), which is most of the time.
+
+1. **Skeleton:** `ino connector definition new <folder> --id local_<name> --kind marketing|ecommerce|pos`. It passes the engine's rules as it is.
+   Read the `RULES.md` it writes before changing anything: it lists what a package of that kind may do.
+   - `marketing`: Ino sends profiles, events, unsubscribes and deletions to the tool (Marketing Activation).
+   - `ecommerce`: the shop's signed webhooks become sales and returns in Ino; the firm enters the shop's API key at install.
+   - `pos`: the tills' sales file mapped to Ino POS file v1 (columns, record and payment types, dates, amounts). No calls.
+2. **Edit, then check without saving:** `ino connector package check <folder>/connector.json` lists every rule the file breaks, or its kind and
+   access summary. Repeat until it passes. Never invent fields: take them from the platform's API documentation and from `ino docs search`.
+3. **Save:** `ino connector package save <folder>/connector.json`. A saved version never changes; raise `version` for a new one.
+4. **Use it** (a person decides; show them the summary and let them confirm):
+   - marketing tool: `ino marketing connect --definition <id> --version <v> --setting k=v … --processor … --country … --key-env <VAR>` prints
+     what it sends and where, and needs `--confirm <reviewHash>`; then `ino marketing verify <connection id>`. In Power Apps: Marketing Activation
+     → "Your own package".
+   - e-commerce: `ino connector package preview <id> <v> --set …` with a credential, then `install` with the access hash it printed (test tenants).
+   - POS file format: Power Apps → Integrations → Channels → the channel → "POS file format" (preview, review, pin).
+5. **A new version later:** save it, then `ino marketing repin <connection id> --version <new>` shows what changes; with `--confirm <reviewHash>`
+   it moves the connection (same account and key). A live connection pauses until `ino marketing verify`.
+
+Rules for every definition package:
+- Ids start with `local_`. Addresses come only from the firm's `url` settings (https); the key is entered by the firm, never written in the file.
+- On a live tenant, saving needs the firm's "own packages" setting and the Connector Installer role; installing and connecting are done by a person
+  who reviews the summary. Do not try to get around a refusal: tell the person what it says.
+- Never put keys, secrets or member data in the file, in chat or in logs.
+
+## Otherwise: a self-hosted connector
+
+Use this when the platform needs logic a definition cannot express (an SDK only, a custom protocol, heavy transformation).
 
 # Writing a self-hosted Ino connector
 

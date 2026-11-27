@@ -1,0 +1,53 @@
+{
+  "id": "__ID__",
+  "name": "__NAME__",
+  "vendor": "Your company",
+  "category": "ECOMMERCE",
+  "version": "1.0.0",
+  "schemaVersion": 1,
+  "supportLevel": "community",
+  "description": "Records paid orders and refunds from __NAME__ in Ino Loyalty.",
+  "settings": [
+    { "key": "baseUrl", "label": "Shop API address", "type": "url", "required": true, "description": "The shop's REST address, e.g. https://api.example-shop.com/v1" },
+    { "key": "channel", "label": "Ino channel", "type": "channel", "required": true, "description": "The Ino channel the shop's orders are recorded on" }
+  ],
+  "auth": { "kinds": ["BEARER"] },
+  "request": { "baseUrlSetting": "baseUrl", "timeoutSeconds": 10 },
+  "inbound": {
+    "channelSetting": "channel",
+    "verify": { "kind": "HMAC_SHA256", "header": "X-Shop-Signature", "encoding": "hex", "prefix": "sha256=" },
+    "topic": { "from": "$headers.X-Shop-Topic" },
+    "eventId": { "from": "$headers.X-Shop-Event-Id" },
+    "key": { "from": "order.code" },
+    "version": { "from": "order.updatedAt" },
+    "routes": [
+      { "id": "record-paid", "name": "Record paid orders", "topics": ["orders/paid", "orders/updated"],
+        "when": { "path": "order.status", "op": "in", "value": ["PAID", "SHIPPED"] },
+        "operation": "transaction.create",
+        "requestKey": { "template": "commit:{{order.code}}" },
+        "results": { "CONFLICT": "success" },
+        "context": { "channel": { "const": "ECOM" } },
+        "payload": {
+          "order_number": { "from": "order.code" },
+          "transaction.customer_id": { "from": "order.loyaltyId", "default": null },
+          "transaction.channel": { "const": "ECOM" },
+          "transaction.current_sale_price": { "from": "order.total" },
+          "transaction.original_sale_price": { "from": "order.total" },
+          "transaction.items": { "each": "order.lines", "item": {
+            "row_number": { "from": "n" }, "product_stock_code": { "from": "sku" }, "quantity": { "from": "qty" },
+            "current_unit_sale_price": { "from": "price" }, "original_unit_sale_price": { "from": "price" } } },
+          "payments": { "each": "order.payments", "item": { "payment_type_code": { "const": "CREDIT_CARD" }, "amount": { "from": "amount" } } }
+        } },
+      { "id": "refund", "name": "Record refunds", "topics": ["orders/updated"],
+        "when": { "path": "order.status", "op": "eq", "value": "REFUNDED" },
+        "operation": "transaction.return.commit",
+        "requestKey": { "template": "refund:{{order.code}}" },
+        "context": { "channel": { "const": "ECOM" } },
+        "payload": {
+          "order_number": { "from": "order.code" },
+          "returned_items": { "each": "order.lines", "item": { "row_number": { "from": "n" }, "product_stock_code": { "from": "sku" }, "quantity": { "from": "qty" } } },
+          "return_type": { "const": "RETURN" }
+        } }
+    ]
+  }
+}

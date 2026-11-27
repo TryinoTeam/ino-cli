@@ -1,0 +1,22 @@
+{
+  "id": "__ID__",
+  "name": "__NAME__",
+  "vendor": "Your company",
+  "category": "POS",
+  "version": "1.0.0",
+  "schemaVersion": 1,
+  "supportLevel": "community",
+  "description": "The sales file __NAME__ tills export, read as Ino POS file v1.",
+  "settings": [],
+  "posFile": {
+    "delimiter": ";",
+    "columns": {
+      "RecordType": "RecordType", "OrderNumber": "ReceiptNo", "ReturnNumber": "ReturnNo", "TransactionDate": "SoldAt", "StoreCode": "Store", "TillId": "Register",
+      "LineNumber": "Line", "Sku": "Sku", "Quantity": "Qty", "UnitPrice": "Price", "PaymentType": "Tender", "PaymentAmount": "Amount", "CustomerId": "LoyaltyId"
+    },
+    "recordTypes": { "SALE_LINE": ["S"], "PAYMENT": ["P"], "RETURN_LINE": ["R"] },
+    "paymentTypes": { "CASH": "CASH", "CARD": "CARD" },
+    "dateFormat": "yyyy-MM-dd HH:mm",
+    "amountScale": 1
+  }
+}

@@ -37,6 +37,11 @@ public class ConnectorPackageCommandTests
                     return p.EndsWith("/preview", StringComparison.Ordinal)
                         ? RouteHandler.Json("""{"data":{"id":"local_pos","version":"1.0.0","sha256":"abcdef0123456789abcdef","host":"pos.example.com","accessHash":"a1:feed","channels":["POS"],"access":{"events":["transaction.completed"],"actions":[{"method":"POST","path":"/x","events":["transaction.completed"]}],"writes":[{"operation":"transaction.create","financial":true,"profile":false}],"reads":[],"memberMatch":[],"webhooks":false}}}""")
                         : RouteHandler.Json("""{"data":{"id":"6f1c0e0a-0000-4000-8000-000000000001","created":true}}""");
+                case "/t/tabc1234/manage/v1/connector-packages/check":
+                    Posts.Add((req.RequestUri.AbsolutePath, body, null));
+                    return Encoding.UTF8.GetString(body).Contains("\"acme\"", StringComparison.Ordinal)
+                        ? RouteHandler.Json("""{"data":{"ok":false,"errors":["id: your own connector's id starts with local_ (for example local_acme).","posFile.amountScale: 1 or 100."]}}""")
+                        : RouteHandler.Json("""{"data":{"ok":true,"errors":[],"id":"local_harbor-pos","version":"1.0.0","category":"POS_FILE","accessHash":"a1:beef","access":{}}}""");
                 case var p when p.StartsWith("/t/tabc1234/manage/v1/connector-packages/", StringComparison.Ordinal) && req.Method == HttpMethod.Post:
                     Posts.Add((p, body, null));
                     return RouteHandler.Json("""{"data":{"ok":true,"id":"local_pos","version":"1.0.0"}}""");
@@ -166,5 +171,30 @@ public class ConnectorPackageCommandTests
         var (bad, _, badErr) = await h.Run("--profile", "dev", "connector", "package", "preview", "local_pos", "1.0.0", "--set", "stores=[S1");
         Assert.Equal(ExitCodes.Usage, bad);
         Assert.Contains("a list is JSON", badErr);
+    }
+
+    [Fact]
+    public async Task Definition_new_writes_each_kind_and_check_lists_every_problem_without_saving()
+    {
+        var (h, f) = await SignedIn();
+        using var hh = h;
+        var dir = Path.Combine(h.Dir, "harbor-pos");
+        var (code, output, err) = await h.Run("connector", "definition", "new", dir, "--id", "local_harbor-pos", "--kind", "pos");
+        Assert.True(code == ExitCodes.Ok, err);
+        Assert.Contains("ino connector package check", output);
+        Assert.Equal("POS", JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(dir, "connector.json")))!["category"]!.ToString());
+        Assert.Equal(ExitCodes.Usage, (await h.Run("connector", "definition", "new", Path.Combine(h.Dir, "x"), "--id", "local_x1", "--kind", "crm")).Code);
+
+        var (ok, passed, okErr) = await h.Run("--profile", "dev", "connector", "package", "check", Path.Combine(dir, "connector.json"));
+        Assert.True(ok == ExitCodes.Ok, okErr);
+        Assert.Contains("passes the engine's package rules", passed);
+        var bad = Path.Combine(h.Dir, "bad.json");
+        await File.WriteAllTextAsync(bad, """{"id":"acme"}""");
+        var (failed, problems, _) = await h.Run("--profile", "dev", "connector", "package", "check", bad);
+        Assert.Equal(ExitCodes.Business, failed);
+        Assert.Contains("2 problems", problems);
+        Assert.Contains("amountScale", problems);
+        // Checking never saves.
+        Assert.DoesNotContain(f.Posts, p => p.Path.EndsWith("/connector-packages", StringComparison.Ordinal));
     }
 }
