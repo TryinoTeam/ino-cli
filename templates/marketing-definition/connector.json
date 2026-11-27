@@ -1,0 +1,58 @@
+{
+  "id": "__ID__",
+  "name": "__NAME__",
+  "vendor": "Your company",
+  "category": "MARKETING",
+  "version": "1.0.0",
+  "schemaVersion": 1,
+  "supportLevel": "community",
+  "description": "Sends loyalty profiles, events, unsubscribes and deletions to __NAME__.",
+  "settings": [
+    { "key": "apiUrl", "label": "API address", "type": "url", "required": true, "description": "The tool's REST address, e.g. https://api.example.com/v1" }
+  ],
+  "auth": { "kinds": ["BEARER"] },
+  "request": { "baseUrlSetting": "apiUrl", "timeoutSeconds": 10 },
+  "marketing": {
+    "profile": { "propertyNames": "snake_case", "unsetValue": null },
+    "eventNames": "ino",
+    "consent": [
+      { "path": "profile.email_status", "channel": "EMAIL", "value": "unsubscribed" }
+    ],
+    "constants": { "unsubscribed": "unsubscribed" },
+    "operations": {
+      "upsertProfile": {
+        "request": { "method": "POST", "path": "/profiles", "body": { "profile": { "merge": [
+          { "object": {
+              "external_id": { "from": "$root.profile.customerId" },
+              "email": { "from": "$root.profile.contact.email", "omit_if_null": true },
+              "phone": { "from": "$root.profile.contact.phone", "omit_if_null": true },
+              "first_name": { "from": "$root.profile.contact.firstName", "omit_if_null": true },
+              "last_name": { "from": "$root.profile.contact.lastName", "omit_if_null": true },
+              "email_status": { "from": "$vars.unsubscribed", "when": { "path": "$root.profile.consent.emailRejected", "op": "eq", "value": true } } } },
+          { "from": "$root.profile.attributes" } ] } } },
+        "remoteProfileId": { "from": "$root.profile.customerId" }
+      },
+      "trackEvent": {
+        "request": { "method": "POST", "path": "/events", "body": {
+          "external_id": { "from": "$root.remoteProfileId" },
+          "name": { "from": "$root.event.name" },
+          "time": { "from": "$root.event.time" },
+          "properties": { "from": "$root.event.properties" } } }
+      },
+      "unsubscribe": {
+        "request": { "method": "POST", "path": "/profiles/{{$root.remoteProfileId}}/unsubscribe", "body": {
+          "profile": { "object": { "email_status": { "from": "$vars.unsubscribed", "when": { "path": "$root.unsubscribe.channel", "op": "eq", "value": "EMAIL" } } } } } }
+      },
+      "deleteProfile": {
+        "request": { "method": "DELETE", "path": "/profiles/{{$root.remoteProfileId}}" },
+        "outcomes": [ { "status": [404], "result": "already_gone" } ]
+      },
+      "profileExists": {
+        "request": { "method": "GET", "path": "/profiles/{{$root.remoteProfileId}}" },
+        "outcomes": [ { "status": [404], "result": "success" } ],
+        "exists": "2xx"
+      },
+      "verify": { "request": { "method": "GET", "path": "/me" } }
+    }
+  }
+}

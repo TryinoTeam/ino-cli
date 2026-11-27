@@ -1018,14 +1018,31 @@ public static class Commands
                 $"{c?["id"],-36} {c?["type"],-8} {c?["status"],-16} {c?["name"]}  {c?["account"]}")));
         });
         var mName = new Option<string>("--name") { Description = "A name for the connection, e.g. \"Our CRM mailer\"", Required = true };
-        var mUrl = new Option<string>("--url") { Description = "Your tool's https address; Ino posts every signed request there", Required = true };
+        var mUrl = new Option<string?>("--url") { Description = "Your tool's https address; Ino posts every signed request there (not with --definition)" };
+        // IL3b-3 (docs/INTEGRATION_LAYER.md §8): a marketing tool described by the firm's own definition package.
+        var mDef = new Option<string?>("--definition") { Description = "Connect through your own marketing tool package (local_…; save it first with `ino connector package save`)" };
+        var mDefVersion = new Option<string?>("--version") { Description = "The package version (with --definition)" };
+        var mSetting = new Option<string[]>("--setting") { Description = "A package setting as key=value, e.g. --setting apiUrl=https://api.example.com/v2 (repeat for each)", AllowMultipleArgumentsPerToken = false };
+        var mProcessor = new Option<string?>("--processor") { Description = "The company that runs the tool (for members' KVKK answers), e.g. \"Acme Mailer Inc.\"" };
+        var mCountry = new Option<string?>("--country") { Description = "Where the tool keeps the data, e.g. \"United States\"" };
+        var mKeyEnv = new Option<string?>("--key-env") { Description = "The environment variable that holds the tool's API key (the key never goes on the command line)" };
+        var mKeyFile = new Option<string?>("--key-file") { Description = "A file (mode 0600) that holds the tool's API key" };
+        var mConfirm = new Option<string?>("--confirm") { Description = "The review hash a run without it printed: connects only if what the package sends, and where, is still that" };
         var mEnv = new Option<string?>("--env-file") { Description = "Write INO_MA_CONNECTION_ID and INO_MA_SIGNING_SECRET to this new file (mode 0600; an existing file is not overwritten)" };
         var mShow = new Option<bool>("--show-secret") { Description = "Print the signing secret here (it ends up in your terminal history or an AI agent's transcript)" };
-        var mConnect = new Command("connect", "Add your own marketing tool. Ino signs every call with a new secret, shown once: keep it with --env-file or --show-secret. Then run `ino marketing verify`")
-            { mName, mUrl, mEnv, mShow };
+        var mConnect = new Command("connect", "Add your own marketing tool (--url: Ino signs every call with a new secret, shown once: keep it with --env-file or --show-secret), or connect a tool through your own definition package (--definition). Then run `ino marketing verify`")
+            { mName, mUrl, mEnv, mShow, mDef, mDefVersion, mSetting, mProcessor, mCountry, mKeyEnv, mKeyFile, mConfirm };
         Bind(mConnect, async pr =>
         {
             var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            if (pr.GetValue(mDef) is { } definition)
+            {
+                if (pr.GetValue(mUrl) is not null || pr.GetValue(mEnv) is not null || pr.GetValue(mShow))
+                    throw new CliException(ExitCodes.Usage, "BAD_OPTIONS", "--definition connects through a package: --url, --env-file and --show-secret belong to your own tool.");
+                await ConnectDefinitionAsync(pr, name, prof, definition);
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(pr.GetValue(mUrl))) throw new CliException(ExitCodes.Usage, "NO_URL", "Give your tool's address with --url, or a package with --definition.");
             var envFile = pr.GetValue(mEnv);
             var show = pr.GetValue(mShow);
             if (envFile is null && !show)
@@ -1069,6 +1086,89 @@ public static class Commands
                 (show ? $"\nSigning secret: {secret}\nThis is the only time it is shown." : "") +
                 $"\nWhen your tool answers the ping, run: ino marketing verify {id}");
         });
+        async Task ConnectDefinitionAsync(ParseResult pr, string name, Profile prof, string definition)
+        {
+            var version = pr.GetValue(mDefVersion) ?? throw new CliException(ExitCodes.Usage, "NO_VERSION", "Give the package version with --version.");
+            var settings = new JsonObject();
+            foreach (var kv in pr.GetValue(mSetting) ?? [])
+            {
+                var at = kv.IndexOf('=');
+                if (at <= 0) throw new CliException(ExitCodes.Usage, "BAD_SETTING", $"--setting {kv}: write it as key=value.");
+                settings[kv[..at].Trim()] = kv[(at + 1)..].Trim();
+            }
+            var target = InoLogin.TargetOf(prof.BaseUrl);
+            var path = $"marketing/definitions/{Uri.EscapeDataString(definition)}/{Uri.EscapeDataString(version)}";
+            // T20 (Gate T M2): the summary first. Connecting needs --confirm with the review hash this summary printed, so the approval is of what
+            // was shown: the package's access and the hosts with these settings (an AI agent shows it to the person and asks).
+            var preview = await InoLogin.ManageAsync(ctx, name, target, HttpMethod.Post, path + "/preview", new JsonObject { ["settings"] = settings.DeepClone() }, null, ct);
+            var reviewHash = preview?["reviewHash"]?.ToString() ?? throw new CliException(ExitCodes.Business, "NO_REVIEW", "Ino returned no review hash; update the engine.");
+            if (pr.GetValue(mConfirm) != reviewHash)
+            {
+                if (pr.GetValue(json)) Write(ctx, true, new JsonObject { ["preview"] = preview?.DeepClone(), ["confirmed"] = false }, "");
+                else ctx.Out.WriteLine(MarketingAccessText(preview));
+                throw new CliException(ExitCodes.Usage, "CONFIRM", pr.GetValue(mConfirm) is null
+                    ? $"Review what the package sends above. To connect, run the same command with --confirm {reviewHash}"
+                    : $"What the package sends, or where, changed since that review. Review it above; to connect, use --confirm {reviewHash}");
+            }
+            if (string.IsNullOrWhiteSpace(pr.GetValue(mName))) throw new CliException(ExitCodes.Usage, "NO_NAME", "Give the connection a name with --name.");
+            if (string.IsNullOrWhiteSpace(pr.GetValue(mProcessor)) || string.IsNullOrWhiteSpace(pr.GetValue(mCountry)))
+                throw new CliException(ExitCodes.Usage, "NO_PROCESSOR", "Give --processor (the company that runs the tool) and --country (where it keeps the data): members' KVKK answers name them.");
+            var key = TransportSeal.ReadKey(pr.GetValue(mKeyEnv), pr.GetValue(mKeyFile), ctx.Err, KeyEnv);
+            var sealedKey = await SealAsync(name, target, key);
+            var body = new JsonObject
+            {
+                ["name"] = pr.GetValue(mName), ["definition"] = definition, ["version"] = version, ["settings"] = settings, ["key"] = sealedKey,
+                ["processor"] = pr.GetValue(mProcessor), ["country"] = pr.GetValue(mCountry), ["reviewHash"] = reviewHash,
+            };
+            var data = await KeyWrite(name, target, "marketing/connections", body,
+                "Ino did not confirm the connection. Run `ino marketing list`: if it is not there, run the same command again.");
+            var id = data?["connectionId"]?.ToString() ?? throw new CliException(ExitCodes.Business, "NO_CONNECTION", "Ino returned no connection.");
+            var existing = data?["existing"]?.GetValue<bool>() == true;
+            Write(ctx, pr.GetValue(json), new JsonObject { ["connectionId"] = id, ["definition"] = definition, ["version"] = version, ["hosts"] = data?["hosts"]?.DeepClone(),
+                ["status"] = data?["status"]?.DeepClone(), ["existing"] = existing },
+                existing
+                    ? $"This tool account is already connected through {definition} {version} as {id} ({data?["status"]?.ToString().ToLowerInvariant()}); its key was not changed.\nTo replace the key: ino marketing key {id} --key-env <VARIABLE>; then ino marketing verify {id}"
+                    : $"Added {pr.GetValue(mName)} through {definition} {version} as {id}; nothing is sent until it is verified.\nRun: ino marketing verify {id}");
+        }
+
+        string? KeyEnv(string n) => ctx.Env.TryGetValue(n, out var v) && !string.IsNullOrEmpty(v) ? v : Environment.GetEnvironmentVariable(n);
+
+        async Task<JsonObject> SealAsync(string name, InoLogin.Target target, string secret)
+        {
+            var tk = await InoLogin.ManageAsync(ctx, name, target, HttpMethod.Get, "transport-key", null, null, ct);
+            var kid = tk?["kid"]?.ToString();
+            var publicKey = tk?["publicKey"]?.ToString();
+            if (string.IsNullOrEmpty(kid) || string.IsNullOrEmpty(publicKey)) throw new CliException(ExitCodes.Business, "NO_TRANSPORT_KEY", "Ino returned no transport key.");
+            try { return TransportSeal.Seal(kid, publicKey, secret); }
+            catch (System.Security.Cryptography.CryptographicException) { throw new CliException(ExitCodes.Business, "BAD_TRANSPORT_KEY", "Ino's transport key could not be used."); }
+            catch (FormatException) { throw new CliException(ExitCodes.Business, "BAD_TRANSPORT_KEY", "Ino's transport key could not be used."); }
+        }
+
+        static string MarketingAccessText(JsonNode? d)
+        {
+            var a = d?["access"];
+            static IEnumerable<string> Items(JsonNode? n) => n is JsonArray arr ? arr.Select(x => x?.ToString() ?? "") : [];
+            var sha = d?["sha256"]?.ToString() ?? "";
+            var lines = new List<string> { $"{d?["definition"]} {d?["version"]} (sha256 {sha[..Math.Min(12, sha.Length)]}…)", $"  sends to        {string.Join(", ", Items(d?["hosts"]))}" };
+            if (a?["contact"] is JsonArray { Count: > 0 } contact) lines.Add($"  contact fields  {string.Join(", ", Items(contact))}");
+            if (a?["attributes"]?.GetValue<bool>() == true) lines.Add("  profile fields  the loyalty fields the firm allows (tier, points, …)");
+            // Gate T m5: each body field is marked: [checked] = a declared subscription field Ino checks; every other field carries Ino's data as the
+            // package maps it and Ino cannot check what the tool does with it, so a subscription field missing from the consent list shows here.
+            var checkedPaths = Items(a?["consent"]).Select(x => x.Split(' ')[0].Replace("[*]", "").Replace("[0]", "")).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var o in a?["operations"]?.AsArray() ?? [])
+            {
+                lines.Add($"  {o?["operation"],-15} {o?["method"]} {o?["path"]}{(o?["query"] is JsonArray { Count: > 0 } q ? " ?" + string.Join("&", Items(q)) : "")}");
+                foreach (var bp in Items(o?["bodyPaths"]))
+                    lines.Add($"                  {(checkedPaths.Contains(bp.Replace("[*]", "")) ? "[checked] " : "          ")}{bp}");
+            }
+            if (a?["constants"] is JsonArray { Count: > 0 } k) lines.Add($"  constants       {string.Join(", ", Items(k))}");
+            lines.Add(a?["consent"] is JsonArray { Count: > 0 } c ? $"  consent fields  {string.Join(", ", Items(c))}" : "  consent fields  NONE DECLARED");
+            if (a?["events"] is JsonArray { Count: > 0 } ev) lines.Add($"  events          {string.Join(", ", Items(ev))}");
+            lines.Add($"  review hash     {d?["reviewHash"]}");
+            if (d?["warning"]?.ToString() is { Length: > 0 } w) lines.Add($"  NOTE            {w}");
+            return string.Join("\n", lines);
+        }
+
         var mId = new Argument<Guid>("connection-id") { Description = "The connection's id (see `ino marketing list`)" };
         var mVerify = new Command("verify", "Send a signed ping to your tool; it connects when the tool answers with the challenge and its proof (also reconnects a disconnected one)") { mId };
         Bind(mVerify, async pr =>
@@ -1281,6 +1381,34 @@ public static class Commands
         marketing.Subcommands.Add(mActionSet);
         marketing.Subcommands.Add(mActionToken);
         marketing.Subcommands.Add(mDisconnect);
+        var mKeyKeyEnv = new Option<string?>("--key-env") { Description = "The environment variable that holds the new API key" };
+        var mKeyKeyFile = new Option<string?>("--key-file") { Description = "A file (mode 0600) that holds the new API key" };
+        var mKey = new Command("key", "Replace the API key of a connection made through your own package; it pauses until `ino marketing verify` proves the same account") { mId, mKeyKeyEnv, mKeyKeyFile };
+        Bind(mKey, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var id = pr.GetValue(mId);
+            var target = InoLogin.TargetOf(prof.BaseUrl);
+            var sealedKey = await SealAsync(name, target, TransportSeal.ReadKey(pr.GetValue(mKeyKeyEnv), pr.GetValue(mKeyKeyFile), ctx.Err, KeyEnv));
+            var data = await InoLogin.ManageAsync(ctx, name, target, HttpMethod.Post, $"marketing/connections/{id:D}/key", new JsonObject { ["key"] = sealedKey }, null, ct);
+            Write(ctx, pr.GetValue(json), new JsonObject { ["connectionId"] = id.ToString("D"), ["status"] = data?["status"]?.DeepClone() },
+                $"Key replaced; the connection is {data?["status"]?.ToString().ToLowerInvariant()}. Run: ino marketing verify {id:D}");
+        });
+        marketing.Subcommands.Add(mKey);
+        var defDir = new Argument<string>("folder") { Description = "A new folder for the package (connector.json and RULES.md)" };
+        var defName = new Option<string>("--id") { Description = "The package id, local_<name> (lower case, digits and -)", Required = true };
+        var defNew = new Command("new", "Write a marketing tool package skeleton that follows the engine's package rules; edit it, then `ino connector package save`") { defDir, defName };
+        Bind(defNew, pr =>
+        {
+            var files = MarketingDefinitionScaffold.Create(pr.GetValue(defDir)!, pr.GetValue(defName)!);
+            Write(ctx, pr.GetValue(json), new JsonObject { ["dir"] = pr.GetValue(defDir), ["files"] = new JsonArray(files.Select(f => (JsonNode)f).ToArray()) },
+                $"Created {pr.GetValue(defDir)} ({files.Count} files). Edit connector.json for your tool (RULES.md lists what a package may do), then:\n" +
+                "  ino connector package save connector.json\n  ino marketing connect --definition <id> --version 1.0.0 --setting apiUrl=https://… (shows what it sends)");
+            return Task.CompletedTask;
+        });
+        var mDefinition = new Command("definition", "Your own marketing tool packages (definition files the engine runs)");
+        mDefinition.Subcommands.Add(defNew);
+        marketing.Subcommands.Add(mDefinition);
         root.Subcommands.Add(marketing);
 
         // ---------------------------------------------------------------- hub (MCP/CLI P6a: connector store)

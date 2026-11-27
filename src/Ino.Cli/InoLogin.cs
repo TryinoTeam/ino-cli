@@ -240,7 +240,7 @@ public static class InoLogin
             var message = json?["error_description"]?.GetValue<string>() ?? $"Ino refused the request ({status}).";
             var code = json?["error"]?.GetValue<string>()?.ToUpperInvariant();
             throw status is 401 or 403
-                ? new CliException(ExitCodes.Auth, "MANAGE_REFUSED", message)
+                ? new CliException(ExitCodes.Auth, code ?? "MANAGE_REFUSED", message)     // IL3b-3 Gate T m7: insufficient_scope etc. reach --json
                 : new CliException(status >= 500 ? ExitCodes.Network : ExitCodes.FromStatus(status), code ?? (status >= 500 ? "UNAVAILABLE" : "REFUSED"), message);
         }
         return json?["data"];
