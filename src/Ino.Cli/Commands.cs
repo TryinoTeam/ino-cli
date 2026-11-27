@@ -176,9 +176,29 @@ public static class Commands
         root.Subcommands.Add(docs);
 
         // ---------------------------------------------------------------- doctor
-        var doctor = new Command("doctor", "Check the profile, keychain, network, clock and key");
+        var goLiveOpt = new Option<bool>("--go-live") { Description = "Check whether this firm is ready to go live (needs `ino login`); exit 1 if anything blocks or could not be checked" };
+        var doctor = new Command("doctor", "Check the profile, keychain, network, clock and key; --go-live checks the firm instead") { goLiveOpt };
         Bind(doctor, async pr =>
         {
+            if (pr.GetValue(goLiveOpt))
+            {
+                // P1.5a: the firm's go-live items from the engine; only they decide the exit code (optional setup steps never block).
+                var (lname, lprof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+                var data = await InoLogin.ManageAsync(ctx, lname, InoLogin.TargetOf(lprof.BaseUrl), HttpMethod.Get, "setup?goLive=true", null, null, ct) as JsonObject
+                    ?? throw new CliException(ExitCodes.Network, "UNEXPECTED", "The engine sent no checklist.");
+                var step = (data["steps"] as JsonArray ?? []).OfType<JsonObject>().FirstOrDefault(x => x["key"]?.ToString() == "goLive")
+                    ?? throw new CliException(ExitCodes.Usage, "ENGINE_TOO_OLD", "The engine of this firm is too old for `ino doctor --go-live`; it needs the version with P1.5a.");
+                var items = (step["items"] as JsonArray ?? []).OfType<JsonObject>().ToList();
+                // Green only when the step itself was read and every item is ok, warn or info (review P1.5a K1: an unread step has no items).
+                exit = items.Count > 0 && step["status"]?.ToString() is not ("fail" or "unknown")
+                    && items.All(i => i["status"]?.ToString() is "ok" or "warn" or "info") ? ExitCodes.Ok : ExitCodes.Business;
+                var head = $"Go-live check of {Safe(data["tenant"])} ({Safe(data["environment"])}): {Safe(step["detail"])}";
+                Write(ctx, pr.GetValue(json), step.DeepClone(), head + "\n" + string.Join("\n", items.Select(i =>
+                    $"{(i["status"]?.ToString() switch { "ok" => "✓", "warn" => "!", "info" => "–", "unknown" => "?", _ => "✗" })} {Safe(i["key"]),-16} {Safe(i["detail"])}"
+                    + (i["next"] is { } n ? $"\n    → {Safe(n)}" : "")))
+                    + (exit == ExitCodes.Ok ? "\nNothing blocks going live." : "\nNot ready: fix the ✗ items (and recheck the ? ones)."));
+                return;
+            }
             var report = await Doctor.RunAsync(ctx, pr.GetValue(profile), ct);
             exit = report.FirstOrDefault(c => c.State == "fail") is { } f ? f.Name switch
             {
@@ -879,8 +899,6 @@ public static class Commands
             async Task<List<JsonObject>> Read() =>
                 ((await InoLogin.ManageAsync(ctx, name, target, HttpMethod.Get, "request-log?" + query, null, null, ct))?["requests"]?.AsArray() ?? [])
                 .OfType<JsonObject>().Reverse().ToList();   // oldest first, like a log
-            // Review MC1 1: paths, channels and errors come from callers; control characters never reach the terminal.
-            static string Safe(JsonNode? n) => n is null ? "" : new string(n.ToString().Select(c => char.IsControl(c) ? '?' : c).ToArray());
             static string Line(JsonObject r) =>
                 $"{(DateTimeOffset.TryParse(r["createdAt"]?.ToString(), out var at) ? at.ToLocalTime().ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture) : "")} "
                 + $"{Safe(r["httpStatus"]),3} {Safe(r["channel"]),-16} {Safe(r["operation"] ?? r["path"]),-28} {Safe(r["durationMs"]),5} ms  {Safe(r["resultCode"])}"
@@ -918,6 +936,93 @@ public static class Commands
         });
         logsCmd.Subcommands.Add(logsTail);
         root.Subcommands.Add(logsCmd);
+
+        // ---------------------------------------------------------------- setup (P1.1, docs/MCP_CLI_P1_LOG.md): the firm's setup checklist, read only
+        var setupCmd = new Command("setup", "What is set up in this firm and what to do next (program, tiers, catalog, channels, webhooks, campaigns); "
+            + "read only, needs `ino login`. To set up your AI client instead, use `ino agent setup`");
+        Bind(setupCmd, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var data = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Get, "setup", null, null, ct) as JsonObject
+                ?? throw new CliException(ExitCodes.Network, "UNEXPECTED", "The engine sent no checklist.");
+            if (pr.GetValue(json)) { Write(ctx, true, data.DeepClone(), ""); return; }
+            ctx.Out.WriteLine(SetupText(data));
+        });
+        root.Subcommands.Add(setupCmd);
+
+        // ---------------------------------------------------------------- init (P1.2): the firm's setup as files, no secrets
+        var initDir = new Argument<string>("folder") { Description = "Where to write the setup files (default: ./ino-setup)", DefaultValueFactory = _ => "ino-setup" };
+        var initForce = new Option<bool>("--force") { Description = "Replace the setup files in a folder that is not empty (other files are kept)" };
+        var initCmd = new Command("init", "Write this firm's setup (program, tiers, channel settings) to a folder you can keep in git; no secrets; needs `ino login`")
+            { initDir, initForce };
+        Bind(initCmd, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var export = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Get, "config", null, null, ct) as JsonObject
+                ?? throw new CliException(ExitCodes.Network, "UNEXPECTED", "The engine sent no setup.");
+            var dir = pr.GetValue(initDir)!;
+            var written = SetupFolder.Write(dir, export, pr.GetValue(initForce));
+            var skipped = (export["sections"] as JsonObject ?? []).Where(kv => !(kv.Value?["exported"] is JsonValue ev && ev.TryGetValue<bool>(out var on) && on))
+                .Select(kv => new JsonObject { ["section"] = kv.Key, ["reason"] = kv.Value?["reason"]?.DeepClone() }).ToList();
+            Write(ctx, pr.GetValue(json), new JsonObject
+            {
+                ["folder"] = Path.GetFullPath(dir), ["files"] = new JsonArray(written.Select(f => (JsonNode)f).ToArray()),
+                ["notExported"] = new JsonArray(skipped.ToArray()), ["warnings"] = export["warnings"]?.DeepClone(),
+            }, $"Wrote {written.Count} file(s) to {dir}:\n" + string.Join("\n", written.Select(f => "  " + f))
+               + (skipped.Count == 0 ? "" : "\nNot exported:\n" + string.Join("\n", skipped.Select(x => $"  {Safe(x["section"])}: {Safe(x["reason"])}")))
+               + (export["warnings"] is JsonArray { Count: > 0 } w ? "\nWarnings:\n" + string.Join("\n", w.Select(x => "  " + Safe(x))) : ""));
+        });
+        root.Subcommands.Add(initCmd);
+
+        // ---------------------------------------------------------------- plan (P1.3): the difference between a setup folder and a firm; writes nothing
+        var planDir = new Argument<string>("folder") { Description = "The setup folder (default: ./ino-setup)", DefaultValueFactory = _ => "ino-setup" };
+        var planOther = new Option<bool>("--other-firm") { Description = "Compare a folder written from another firm (for example test → live)" };
+        var planEnv = new Option<bool>("--include-environment") { Description = "Count fields that differ by environment (program status, URLs, SMS sender) as changes" };
+        var planCmd = new Command("plan", "Show what differs between a setup folder and this firm; changes nothing; needs `ino login`") { planDir, planOther, planEnv };
+        Bind(planCmd, async pr =>
+        {
+            var (name, prof, _) = ctx.Profiles.ResolveForLogin(pr.GetValue(profile));
+            var dir = pr.GetValue(planDir)!;
+            if (!Directory.Exists(dir)) throw new CliException(ExitCodes.Usage, "NOT_A_SETUP_FOLDER", $"{dir} is not a folder. Run `ino init {dir}` first.");
+            var target = await InoLogin.ManageAsync(ctx, name, InoLogin.TargetOf(prof.BaseUrl), HttpMethod.Get, "config", null, null, ct) as JsonObject
+                ?? throw new CliException(ExitCodes.Network, "UNEXPECTED", "The engine sent no setup.");
+            var plan = SetupPlan.Build(dir, target, pr.GetValue(planOther), pr.GetValue(planEnv));
+            JsonObject Row(SetupPlan.Change c) => new()
+                { ["section"] = c.Section, ["key"] = c.Key, ["field"] = c.Field, ["action"] = c.Action, ["from"] = c.From, ["to"] = c.To };
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"Plan: folder from {plan.Source} → {plan.Target}");
+            if (target["environment"]?.ToString() == "live") sb.AppendLine("! The target is a LIVE firm.");
+            static string Line(SetupPlan.Change c) => c.Action switch
+            {
+                "change" => $"  ~ {(c.Key.Length > 0 ? Safe(c.Key) + "." : "")}{Safe(c.Field)}: {c.From} → {c.To}",
+                "add" => $"  + {Safe(c.Key)}",
+                "remove" => $"  - {Safe(c.Key)}",
+                "reactivate" => $"  ↻ {Safe(c.Key)} (inactive in the firm: reactivate)",
+                _ => $"  {c.Action} {Safe(c.Key)}",
+            };
+            foreach (var group in plan.Changes.GroupBy(c => c.Section))
+            {
+                sb.AppendLine(group.Key + ":");
+                foreach (var c in group) sb.AppendLine(Line(c));
+            }
+            if (plan.ByEnvironment.Count > 0)
+            {
+                sb.AppendLine("Differs by environment (not counted; --include-environment to count):");
+                foreach (var c in plan.ByEnvironment) sb.AppendLine(Line(c));
+            }
+            foreach (var (section, state) in plan.Sections) sb.AppendLine($"  {Safe(section)}: {Safe(state)}");
+            foreach (var w in plan.Warnings) sb.AppendLine("! " + Safe(w));
+            sb.Append(plan.Changes.Count == 0 ? "No changes." : $"{plan.Changes.Count} change(s). Nothing was changed.");
+            Write(ctx, pr.GetValue(json), new JsonObject
+            {
+                ["source"] = plan.Source, ["target"] = plan.Target,
+                ["sections"] = new JsonObject(plan.Sections.Select(kv => KeyValuePair.Create(kv.Key, (JsonNode?)JsonValue.Create(kv.Value)))),
+                ["changes"] = new JsonArray(plan.Changes.Select(c => (JsonNode)Row(c)).ToArray()),
+                ["byEnvironment"] = new JsonArray(plan.ByEnvironment.Select(c => (JsonNode)Row(c)).ToArray()),
+                ["warnings"] = new JsonArray(plan.Warnings.Select(w => (JsonNode)w).ToArray()),
+            }, sb.ToString());
+        });
+        root.Subcommands.Add(planCmd);
 
         // ---------------------------------------------------------------- pos file-format (MC1, docs/INTEGRATION_LAYER.md §10.4)
         var posCmd = new Command("pos", "Point of sale: the file format a channel's POS files are read with; needs `ino login`");
@@ -1920,6 +2025,32 @@ public static class Commands
     }
 
     static void Write(CliContext ctx, bool asJson, JsonNode node, string human) => ctx.Out.WriteLine(asJson ? node.ToJsonString() : human);
+
+    static string Mark(string? status) => status switch { "ok" => "✓", "todo" => "○", "warn" => "!", "info" => "–", _ => "?" };
+
+    /// <summary>The checklist for a person: one line per step, channel lines under it, the next step indented.</summary>
+    internal static string SetupText(JsonObject data)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"Setup of {Safe(data["tenant"])} ({Safe(data["environment"])})");
+        foreach (var step in data["steps"]?.AsArray().OfType<JsonObject>() ?? [])
+        {
+            sb.AppendLine($"{Mark(step["status"]?.ToString())} {Safe(step["title"]),-20} {Safe(step["detail"])}");
+            if (step["next"] is { } next) sb.AppendLine($"    → {Safe(next)}");
+            foreach (var item in step["items"]?.AsArray().OfType<JsonObject>() ?? [])
+            {
+                sb.AppendLine($"    {Mark(item["status"]?.ToString())} {Safe(item["key"]),-18} {Safe(item["detail"])}");
+                if (item["next"] is { } n) sb.AppendLine($"        → {Safe(n)}");
+            }
+        }
+        var sum = data["summary"];
+        sb.Append($"{sum?["todo"]} to do, {sum?["warn"]} to check, {sum?["ok"]} done.");
+        if (sum?["unknown"]?.GetValue<int>() is > 0 and var unknown) sb.Append($" {unknown} could not be read right now.");
+        return sb.ToString();
+    }
+
+    /// <summary>Text from the engine that callers or firm admins wrote (paths, channels, errors): control characters never reach the terminal (review MC1 1).</summary>
+    internal static string Safe(JsonNode? n) => n is null ? "" : new string(n.ToString().Select(c => char.IsControl(c) ? '?' : c).ToArray());
 
     static void WriteError(CliContext ctx, bool asJson, string code, string message, string? hint = null)
     {
